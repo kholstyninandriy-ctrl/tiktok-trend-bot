@@ -18,7 +18,7 @@ from datetime import datetime, timezone, time as dtime
 
 import httpx
 import anthropic
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
@@ -48,6 +48,16 @@ NICHES = {
     "travel": {"hashtags": ["travel", "adventure", "tourism"], "emoji": "✈️"},
     "fashion": {"hashtags": ["fashion", "style", "outfit"], "emoji": "👗"},
 }
+
+# Меню команд (постійні кнопки внизу)
+MAIN_MENU = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("📋 Вибрати нішу"), KeyboardButton("📊 Дайджест")],
+        [KeyboardButton("💬 Запитати Claude"), KeyboardButton("⚙️ Налаштування")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=False,
+)
 
 # Зберігання вибраної ніші та контексту трендів на користувача
 user_niches = {}
@@ -183,6 +193,7 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: str, hashtags
     await context.bot.send_message(
         chat_id=chat_id, text=text,
         parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        reply_markup=MAIN_MENU,
     )
 
 
@@ -206,109 +217,95 @@ async def get_trends_context(hashtags: list[str]) -> str:
 # ---------------- Handlers ----------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    keyboard = [
-        [InlineKeyboardButton("📋 Вибрати нішу", callback_data="niche_menu")],
-        [InlineKeyboardButton("📊 Дайджест зараз", callback_data="digest_now")],
-        [InlineKeyboardButton("💬 Запитати Claude", callback_data="ask_mode")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
         f"👋 Привіт! Твій chat_id: <code>{chat_id}</code>\n\n"
         "Я буду надсилати тобі дайджест трендових TikTok-відео.\n"
-        "Можеш також запитати мене про тренди і контент!",
+        "Можеш також запитати мене про тренди і контент!\n\n"
+        "Вибери функцію з меню внизу 👇",
         parse_mode=ParseMode.HTML,
-        reply_markup=reply_markup,
+        reply_markup=MAIN_MENU,
     )
 
 
-async def cmd_niche(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показує меню вибору ніші."""
-    keyboard = []
-    for niche_key, niche_data in NICHES.items():
-        emoji = niche_data["emoji"]
-        keyboard.append([InlineKeyboardButton(f"{emoji} {niche_key.capitalize()}", callback_data=f"select_niche_{niche_key}")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "🎯 Вибери нішу для дайджесту:",
-        reply_markup=reply_markup,
-    )
-
-
-async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обробляє текстові повідомлення (кнопки меню + режим запитань)."""
     chat_id = update.effective_chat.id
-    hashtags = user_niches.get(chat_id, HASHTAGS)
-    await update.message.reply_text("⏳ Тягну тренди, це 1-3 хв…")
-    await send_digest(context, chat_id, hashtags)
-
-
-async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запускає режим запитань до Claude."""
-    chat_id = update.effective_chat.id
-    context.user_data["ask_mode"] = True
-    await update.message.reply_text(
-        "💬 Режим запитань активний!\n\n"
-        "Напиши своє питання про TikTok тренди, контент, хуки, тощо.\n"
-        "Я буду відповідати з контекстом твоєї ніші.\n\n"
-        "Напиши /cancel щоб вийти."
-    )
-
-
-async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    current_niche = None
-    for niche_key, niche_data in NICHES.items():
-        if user_niches.get(chat_id) == niche_data["hashtags"]:
-            current_niche = f"{niche_data['emoji']} {niche_key.capitalize()}"
-            break
+    text = update.message.text
     
-    if not current_niche:
-        current_niche = "Не вибрана (за замовчуванням)"
+    # Обробка кнопок меню
+    if text == "📋 Вибрати нішу":
+        keyboard = []
+        for niche_key, niche_data in NICHES.items():
+            emoji = niche_data["emoji"]
+            keyboard.append([InlineKeyboardButton(f"{emoji} {niche_key.capitalize()}", callback_data=f"select_niche_{niche_key}")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "🎯 Вибери нішу для дайджесту:",
+            reply_markup=reply_markup,
+        )
     
-    keyboard = [
-        [InlineKeyboardButton("🎯 Змінити нішу", callback_data="niche_menu")],
-        [InlineKeyboardButton("📊 Дайджест зараз", callback_data="digest_now")],
-        [InlineKeyboardButton("💬 Запитати Claude", callback_data="ask_mode")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    elif text == "📊 Дайджест":
+        hashtags = user_niches.get(chat_id, HASHTAGS)
+        await update.message.reply_text("⏳ Тягну тренди, це 1-3 хв…")
+        await send_digest(context, chat_id, hashtags)
     
-    await update.message.reply_text(
-        f"⚙️ <b>Твої налаштування:</b>\n\n"
-        f"Поточна ніша: {current_niche}\n"
-        f"Chat ID: <code>{chat_id}</code>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=reply_markup,
-    )
+    elif text == "💬 Запитати Claude":
+        context.user_data["ask_mode"] = True
+        await update.message.reply_text(
+            "💬 Режим запитань активний!\n\n"
+            "Напиши своє питання про TikTok тренди, контент, хуки, тощо.\n"
+            "Я буду відповідати з контекстом твоєї ніші.\n\n"
+            "Напиши /cancel щоб вийти.",
+            reply_markup=MAIN_MENU,
+        )
+    
+    elif text == "⚙️ Налаштування":
+        current_niche = None
+        for niche_key, niche_data in NICHES.items():
+            if user_niches.get(chat_id) == niche_data["hashtags"]:
+                current_niche = f"{niche_data['emoji']} {niche_key.capitalize()}"
+                break
+        
+        if not current_niche:
+            current_niche = "Не вибрана (за замовчуванням)"
+        
+        keyboard = [
+            [InlineKeyboardButton("🎯 Змінити нішу", callback_data="niche_menu")],
+            [InlineKeyboardButton("📊 Дайджест зараз", callback_data="digest_now")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            f"⚙️ <b>Твої налаштування:</b>\n\n"
+            f"Поточна ніша: {current_niche}\n"
+            f"Chat ID: <code>{chat_id}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+        )
+    
+    # Режим запитань до Claude
+    elif context.user_data.get("ask_mode", False):
+        user_message = text
+        
+        # Отримуємо контекст трендів
+        hashtags = user_niches.get(chat_id, HASHTAGS)
+        trends_context = await get_trends_context(hashtags)
+        
+        # Отримуємо відповідь від Claude
+        await update.message.reply_text("⏳ Думаю…")
+        try:
+            response = claude_chat(user_message, trends_context)
+            await update.message.reply_text(response, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
+        except Exception as e:
+            log.exception("Chat failed")
+            await update.message.reply_text(f"⚠️ Помилка: {e}", reply_markup=MAIN_MENU)
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Вихід з режиму запитань."""
     context.user_data["ask_mode"] = False
-    await update.message.reply_text("❌ Режим запитань вимкнений.")
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробляє звичайні повідомлення в режимі запитань."""
-    chat_id = update.effective_chat.id
-    
-    # Якщо не в режимі запитань — ігноруємо
-    if not context.user_data.get("ask_mode", False):
-        return
-    
-    user_message = update.message.text
-    
-    # Отримуємо контекст трендів
-    hashtags = user_niches.get(chat_id, HASHTAGS)
-    trends_context = await get_trends_context(hashtags)
-    
-    # Отримуємо відповідь від Claude
-    await update.message.reply_text("⏳ Думаю…")
-    try:
-        response = claude_chat(user_message, trends_context)
-        await update.message.reply_text(response, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        log.exception("Chat failed")
-        await update.message.reply_text(f"⚠️ Помилка: {e}")
+    await update.message.reply_text("❌ Режим запитань вимкнений.", reply_markup=MAIN_MENU)
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -347,15 +344,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hashtags = user_niches.get(chat_id, HASHTAGS)
         await query.edit_message_text("⏳ Тягну тренди, це 1-3 хв…")
         await send_digest(context, chat_id, hashtags)
-    
-    elif query.data == "ask_mode":
-        context.user_data["ask_mode"] = True
-        await query.edit_message_text(
-            "💬 Режим запитань активний!\n\n"
-            "Напиши своє питання про TikTok тренди, контент, хуки, тощо.\n"
-            "Я буду відповідати з контекстом твоєї ніші.\n\n"
-            "Напиши /cancel щоб вийти."
-        )
 
 
 async def daily_job(context: ContextTypes.DEFAULT_TYPE):
@@ -367,13 +355,9 @@ async def daily_job(context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("niche", cmd_niche))
-    app.add_handler(CommandHandler("digest", cmd_digest))
-    app.add_handler(CommandHandler("ask", cmd_ask))
-    app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(button_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.job_queue.run_daily(daily_job, time=dtime(hour=DIGEST_HOUR, tzinfo=timezone.utc))
     log.info("Bot started")
     app.run_polling()
