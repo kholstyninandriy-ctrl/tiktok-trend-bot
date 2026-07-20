@@ -169,6 +169,28 @@ def hashtag_keyboard(niche_key: str, selected: set[int]) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(rows)
 
 
+def digest_only_keyboard() -> InlineKeyboardMarkup:
+    """Єдина кнопка в кінці флоу ніша→хештеги→регіон."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Дайджест зараз", callback_data="digest_now")],
+    ])
+
+
+def flow_summary_text(prefs: dict) -> str:
+    """Підсумок поточного вибору юзера після кроку регіону."""
+    if prefs.get("niche_key") in NICHES:
+        niche_data = NICHES[prefs["niche_key"]]
+        niche_label = f"{niche_data['emoji']} {prefs['niche_key'].capitalize()}"
+    else:
+        niche_label = "не вибрана (дефолтна)"
+    hashtags_label = ", ".join(f"#{h}" for h in resolve_hashtags(prefs))
+    return (
+        f"✅ Ніша: {niche_label}, хештеги: {hashtags_label}, "
+        f"регіон: {region_label(prefs['region'])}.\n"
+        "Тисни «📊 Дайджест зараз», щоб отримати перші 5 відео."
+    )
+
+
 def music_style_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(label, callback_data=f"music_style_{key}")]
@@ -329,13 +351,26 @@ def claude_chat(user_message: str, trends_context: str = "") -> str:
     system_prompt = """Ти — експерт з TikTok трендів і контент-креатор.
 Допомагаєш відеомонтажерам робити вірусні рекламні та UGC-ролики.
 Відповідай коротко, практично, з конкретними порадами.
-Якщо користувач питає про тренди — використовуй контекст його останніх трендів."""
+У тебе Є доступ до свіжих даних трендів користувача — вони приходять у
+повідомленні нижче, зібрані сьогодні через наш власний Apify-скрейпер.
+Використовуй їх напряму для відповіді. НІКОЛИ не кажи, що не маєш доступу
+до інтернету чи актуальних даних у реальному часі — доступ уже є, дані
+надані в повідомленні."""
 
-    context_msg = ""
     if trends_context:
-        context_msg = f"\n\nКонтекст останніх трендів користувача:\n{trends_context}"
-
-    prompt = f"{user_message}{context_msg}"
+        prompt = (
+            "Ось реальні дані з нашого пулу трендів за сьогодні (зібрані щойно "
+            f"через Apify для ніші користувача):\n\n{trends_context}\n\n"
+            "Відповідай на основі цих даних. Не кажи, що не маєш доступу до "
+            "інтернету — доступ вже є, ось дані.\n\n"
+            f"Питання користувача: {user_message}"
+        )
+    else:
+        prompt = (
+            f"{user_message}\n\n"
+            "(Свіжих даних пулу трендів зараз немає — дай практичну відповідь "
+            "загалом, без посилань на конкретні відео.)"
+        )
 
     resp = claude.messages.create(
         model="claude-sonnet-4-6",
@@ -478,10 +513,8 @@ async def send_music_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             name = escape(s["musicName"] or "Без назви")
             author = f" — {escape(s['musicAuthor'])}" if s["musicAuthor"] else ""
             lines.append(f"{i}. <b>{name}</b>{author} · у {s['count']} відео")
-            if s["playUrl"]:
-                lines.append(f"   🔊 Слухати: {s['playUrl']}")
             if s["exampleVideo"]:
-                lines.append(f"   📹 Приклад: {s['exampleVideo']}")
+                lines.append(f"   🎬 Приклад відео: {s['exampleVideo']}")
         lines.append("")
 
         if style_key != "any":
@@ -514,19 +547,38 @@ async def send_music_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
 
 # ---- Контекст трендів для Claude-чату (через кеш-пул, без зайвих Apify runs) ----
 async def get_trends_context(chat_id: int, prefs: dict) -> str:
+    """Гарантує актуальний trend_pool (ensure_pool) і збирає з нього контекст:
+    хештеги ніші, топ-5 відео з url, топ звуки — щоб Claude відповідав
+    на реальних даних, а не казав, що "немає доступу до інтернету"."""
+    niche_key = pool_niche_key(prefs)
+    hashtags = resolve_hashtags(prefs)
+    region = prefs.get("region") or "global"
     try:
-        videos, _ = await ensure_pool(
-            chat_id, pool_niche_key(prefs), resolve_hashtags(prefs), prefs["region"]
-        )
-        if not videos:
-            return ""
-        context = "Топ тренди:\n"
-        for i, v in enumerate(videos[:5], 1):
-            context += f"{i}. {v['desc'][:100]} ({v['plays']} views)\n"
-        return context
+        videos, _ = await ensure_pool(chat_id, niche_key, hashtags, region)
     except Exception as e:
         log.error(f"Failed to get trends context: {e}")
         return ""
+    if not videos:
+        return ""
+
+    lines = [
+        f"Регіон: {region_label(region)}",
+        f"Хештеги ніші: {', '.join('#' + h for h in hashtags)}",
+        "",
+        "Топ-5 відео пулу (url реальні, з сьогоднішнього скрейпу):",
+    ]
+    for i, v in enumerate(videos[:5], 1):
+        lines.append(f"{i}. {v['desc'][:100]} — {v.get('plays', 0)} переглядів — {v.get('url', '')}")
+
+    sounds = top_sounds(videos, top_n=5)
+    if sounds:
+        lines.append("")
+        lines.append("Топ звуків пулу:")
+        for i, s in enumerate(sounds, 1):
+            author = f" — {s['musicAuthor']}" if s["musicAuthor"] else ""
+            lines.append(f"{i}. {s['musicName']}{author} (у {s['count']} відео)")
+
+    return "\n".join(lines)
 
 
 # ---------------- Handlers ----------------
@@ -661,14 +713,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def safe_edit_or_send(query, context: ContextTypes.DEFAULT_TYPE, text: str,
                             reply_markup=None, parse_mode=None):
-    """edit_message_text падає на фото-повідомленнях (caption) — тоді шлемо нове."""
+    """Показує нове inline-меню на місці попереднього, щоб у чаті лишалось
+    тільки ОДНЕ активне меню за раз:
+    1) edit_message_text — для звичайних текстових повідомлень;
+    2) edit_message_caption — якщо попереднє повідомлення було фото (/start-банер);
+    3) якщо й це неможливо — знімаємо клавіатуру зі старого повідомлення
+       (edit_message_reply_markup(None)) і шлемо нове."""
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        return
     except BadRequest:
-        await context.bot.send_message(
-            chat_id=query.message.chat_id, text=text,
-            reply_markup=reply_markup, parse_mode=parse_mode,
-        )
+        pass
+    try:
+        await query.edit_message_caption(caption=text, reply_markup=reply_markup, parse_mode=parse_mode)
+        return
+    except BadRequest:
+        pass
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except BadRequest:
+        pass
+    await context.bot.send_message(
+        chat_id=query.message.chat_id, text=text,
+        reply_markup=reply_markup, parse_mode=parse_mode,
+    )
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -743,14 +811,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         region = data.removeprefix("select_region_")
         if region in REGIONS:
             await db.update_user(chat_id, region=region)
+            prefs = await db.get_user(chat_id)
             await safe_edit_or_send(
-                query, context,
-                f"✅ Регіон: <b>{region_label(region)}</b>\n\n"
-                "<i>Тренди по регіону — за geo (IP проксі), це впливає на видачу, "
-                "але не гарантує офіційний trending саме цієї країни.</i>\n\n"
-                "Що далі?",
-                parse_mode=ParseMode.HTML,
-                reply_markup=main_menu_keyboard(),
+                query, context, flow_summary_text(prefs),
+                reply_markup=digest_only_keyboard(),
             )
 
     elif data == "digest_now":
@@ -762,12 +826,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_digest(context, chat_id, prefs)
 
     elif data.startswith("next_"):
-        niche_key = data.removeprefix("next_")
+        # niche_key з callback_data ігноруємо навмисно: якщо це стара кнопка
+        # з попереднього дайджесту (юзер тим часом змінив нішу/хештеги),
+        # довіряємо ТІЛЬКИ поточному стану users в БД, а не даті кнопки.
         prefs = await db.get_user(chat_id)
-        # Кнопка могла лишитись від старої ніші — пул беремо по ній же
-        if niche_key != "default" and niche_key in NICHES and prefs["niche_key"] != niche_key:
-            prefs["niche_key"] = niche_key
-            prefs["hashtags"] = None
         await context.bot.send_message(chat_id=chat_id, text="⏳ Шукаю наступні відео…")
         await send_digest(context, chat_id, prefs)
 
