@@ -56,7 +56,7 @@ HASHTAGS = [h.strip() for h in os.environ.get("HASHTAGS", "football,beauty").spl
 RESULTS_PER_TAG = int(os.environ.get("RESULTS_PER_TAG", "20"))
 DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "8"))
 POOL_SIZE = int(os.environ.get("POOL_SIZE", "30"))          # скільки відео тримаємо в кеш-пулі
-POOL_TTL_HOURS = int(os.environ.get("POOL_TTL_HOURS", "6"))  # коли пул вважати застарілим
+POOL_TTL_HOURS = int(os.environ.get("POOL_TTL_HOURS", "3"))  # коли пул вважати застарілим
 BATCH_SIZE = 5                                               # скільки відео в одному дайджесті
 
 APIFY_ACTOR = "clockworks~tiktok-scraper"
@@ -92,7 +92,7 @@ REGIONS = {
 MUSIC_STYLES = {
     "energy": "🎧 Енергійна / під рекламу",
     "emotional": "🎻 Серйозна / емоційна",
-    "rap": "🔥 Хайповий реп (типу Тревіса Скота)",
+    "rap": "🔥 Хайповий реп-драйв",
     "any": "⭐ Без фільтра стилю",
 }
 
@@ -212,6 +212,19 @@ async def fetch_tiktoks(hashtags: list[str], region: str = "global") -> list[dic
     return items
 
 
+async def fetch_tiktoks_safe(hashtags: list[str], region: str) -> tuple[list[dict], bool]:
+    """Apify з регіоном; якщо country/residential proxy недоступний на плані —
+    не падаємо, а повторюємо запит без proxyCountryCode (Global).
+    Повертає (items, fell_back_to_global)."""
+    try:
+        return await fetch_tiktoks(hashtags, region), False
+    except Exception as e:
+        if region == "global" or not REGIONS.get(region, {}).get("code"):
+            raise
+        log.warning("Apify з регіоном %s впав (%s) — повторюю як Global", region, e)
+        return await fetch_tiktoks(hashtags, "global"), True
+
+
 def velocity_score(item: dict) -> float:
     """Перегляди на годину з моменту публікації — головний сигнал віральності."""
     plays = item.get("playCount") or 0
@@ -253,8 +266,9 @@ def prefilter(items: list[dict], top_n: int = 15) -> list[dict]:
 
 # ---------------- Пул трендів (кеш, щоб не палити Apify-кредити) ----------------
 async def ensure_pool(chat_id: int, niche_key: str, hashtags: list[str],
-                      region: str, force: bool = False) -> list[dict]:
-    """Повертає пул відео: з кешу, якщо він свіжий, інакше — новий Apify run."""
+                      region: str, force: bool = False) -> tuple[list[dict], bool]:
+    """Повертає (пул відео, чи був фолбек на Global): з кешу, якщо він свіжий,
+    інакше — новий Apify run."""
     if not force:
         cached = await db.get_pool(chat_id, niche_key, region)
         if cached:
@@ -262,11 +276,19 @@ async def ensure_pool(chat_id: int, niche_key: str, hashtags: list[str],
             age = datetime.now(timezone.utc) - fetched_at
             if videos and age < timedelta(hours=POOL_TTL_HOURS):
                 log.info("Pool cache hit: chat=%s niche=%s region=%s", chat_id, niche_key, region)
-                return videos
-    items = await fetch_tiktoks(hashtags, region)
+                return videos, False
+    items, fell_back = await fetch_tiktoks_safe(hashtags, region)
     videos = prefilter(items, top_n=POOL_SIZE)
     await db.save_pool(chat_id, niche_key, region, videos)
-    return videos
+    return videos, fell_back
+
+
+async def notify_region_fallback(context: ContextTypes.DEFAULT_TYPE, chat_id: int, region: str):
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"Регіон {region_label(region)} поки недоступний на нашому Apify-плані, "
+             "показую Global 🌍",
+    )
 
 
 async def pool_is_fresh(chat_id: int, prefs: dict) -> bool:
@@ -372,13 +394,17 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, pr
     hashtags = resolve_hashtags(prefs)
     region = prefs.get("region") or "global"
     try:
-        videos = await ensure_pool(chat_id, niche_key, hashtags, region)
+        videos, fell_back = await ensure_pool(chat_id, niche_key, hashtags, region)
+        if fell_back:
+            await notify_region_fallback(context, chat_id, region)
         seen = await db.get_seen_urls(chat_id, niche_key)
         unseen = [v for v in videos if v.get("url") and v["url"] not in seen]
 
         if len(unseen) < BATCH_SIZE:
             await context.bot.send_message(chat_id=chat_id, text="🔄 Оновлюю пул трендів…")
-            videos = await ensure_pool(chat_id, niche_key, hashtags, region, force=True)
+            videos, fell_back2 = await ensure_pool(chat_id, niche_key, hashtags, region, force=True)
+            if fell_back2 and not fell_back:
+                await notify_region_fallback(context, chat_id, region)
             seen = await db.get_seen_urls(chat_id, niche_key)
             unseen = [v for v in videos if v.get("url") and v["url"] not in seen]
 
@@ -433,7 +459,11 @@ async def send_music_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                             prefs: dict, style_key: str):
     niche_key = pool_niche_key(prefs)
     try:
-        videos = await ensure_pool(chat_id, niche_key, resolve_hashtags(prefs), prefs["region"])
+        videos, fell_back = await ensure_pool(
+            chat_id, niche_key, resolve_hashtags(prefs), prefs["region"]
+        )
+        if fell_back:
+            await notify_region_fallback(context, chat_id, prefs["region"])
         sounds = top_sounds(videos)
         if not sounds:
             await context.bot.send_message(
@@ -485,7 +515,7 @@ async def send_music_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
 # ---- Контекст трендів для Claude-чату (через кеш-пул, без зайвих Apify runs) ----
 async def get_trends_context(chat_id: int, prefs: dict) -> str:
     try:
-        videos = await ensure_pool(
+        videos, _ = await ensure_pool(
             chat_id, pool_niche_key(prefs), resolve_hashtags(prefs), prefs["region"]
         )
         if not videos:

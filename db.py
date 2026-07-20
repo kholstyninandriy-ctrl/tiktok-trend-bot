@@ -13,6 +13,9 @@ from datetime import datetime, timezone
 
 import aiosqlite
 
+# УВАГА (Railway): файлова система стирається при кожному redeploy.
+# Щоб база переживала деплої — підключи Volume (наприклад, у /data)
+# і постав env DB_PATH усередину точки монтування: DB_PATH=/data/bot.db
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
 SEEN_KEEP_PER_USER = 200
