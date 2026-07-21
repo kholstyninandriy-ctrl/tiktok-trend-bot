@@ -817,11 +817,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(LANGUAGE_PROMPT, reply_markup=language_keyboard())
         return
     lang = prefs["lang"]
-    if prefs.get("niche_key"):
-        # Юзер повертається (вже проходив онбординг і має нішу) — одразу меню дій.
-        await update.message.reply_text(t(lang, "menu_opened"), reply_markup=main_menu_keyboard(lang))
+    if not prefs.get("onboarded"):
+        # Ще не натискав "🚀 Почати" — навіть якщо мова вже обрана (а отже
+        # рядок в users уже існує), для юзера це все ще перший візит.
+        await send_onboarding_message(update.message, context, lang)
         return
-    await send_onboarding_message(update.message, context, lang)
+    await update.message.reply_text(t(lang, "menu_opened"), reply_markup=main_menu_keyboard(lang))
 
 
 async def cmd_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1190,6 +1191,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
     elif data == "onboarding_start":
+        # Позначаємо онбординг пройденим тут (не на виборі мови) — далі
+        # всі /start одразу показують меню дій, а не цей екран знову.
+        await db.update_user(chat_id, onboarded=True)
         await safe_edit_or_send(
             query, context, t(lang, "niche_menu_prompt"), reply_markup=niche_menu_keyboard(lang),
         )
