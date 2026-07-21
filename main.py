@@ -80,8 +80,8 @@ POOL_SIZE = int(os.environ.get("POOL_SIZE", "30"))            # скільки �
 POOL_TTL_HOURS = int(os.environ.get("POOL_TTL_HOURS", "3"))   # коли пул вважати застарілим
 BATCH_SIZE = 5                                                # скільки відео в одному дайджесті
 
-ADMIN_CHAT_ID = os.environ.get("734504128")
-ADMIN_USERNAME = os.environ.get("kholstynin", "admin")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 
 FREE_DAILY_DIGEST_LIMIT = 1
 FREE_MUSIC_TOP_N = 3
@@ -1174,6 +1174,16 @@ async def pro_expiry_job(context: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     await db.init_db()
     log.info("SQLite ready: %s", db.DB_PATH)
+    if ADMIN_CHAT_ID:
+        try:
+            admin_id = int(ADMIN_CHAT_ID)
+        except ValueError:
+            log.warning("ADMIN_CHAT_ID=%r не є числом — не можу автоматично видати Pro", ADMIN_CHAT_ID)
+        else:
+            # Адмін завжди має Pro без ручного /set_tier — pro_until лишається
+            # NULL, тому pro_expiry_job ніколи його не понизить.
+            await db.update_user(admin_id, tier="pro")
+            log.info("Admin %s has permanent Pro (auto-provisioned on startup)", admin_id)
 
 
 def main():
