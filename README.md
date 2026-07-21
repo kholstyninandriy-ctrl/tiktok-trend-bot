@@ -48,8 +48,8 @@
 | `DB_PATH` | ні | `bot.db` | шлях до SQLite-бази |
 | `POOL_SIZE` | ні | `30` | скільки відео тримати в кеш-пулі |
 | `POOL_TTL_HOURS` | ні | `3` | через скільки годин пул вважати застарілим |
-| `ADMIN_CHAT_ID` | ні | — | chat_id, якому доступні адмінські команди |
-| `ADMIN_USERNAME` | ні | `admin` | @username адміна, показується в `/upgrade` |
+| `ADMIN_CHAT_ID` | 734504128 | — | chat_id, якому доступні адмінські команди |
+| `ADMIN_USERNAME` | kholstynin | `admin` | @username адміна, показується в `/upgrade` |
 
 ## Деплой на Railway
 
