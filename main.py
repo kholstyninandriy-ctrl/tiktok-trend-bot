@@ -123,6 +123,32 @@ REGIONS = {
 
 MUSIC_STYLE_KEYS = ["energy", "emotional", "rap", "any"]
 
+# Розширений список країн для гортання кнопками ("🌍 Ще країни") — юзери
+# явно не хочуть вписувати коди руками. Назви англійською: повний переклад
+# ~46 країн на 6 мов не виправдано, флаг+назва зрозумілі незалежно від мови
+# інтерфейсу. select_region_{code} — той самий callback, що й у преset-кнопок,
+# тому Pro-гейт і фолбек на Global (region_country_code) працюють без змін.
+MORE_COUNTRIES = [
+    ("FR", "🇫🇷 France"), ("ES", "🇪🇸 Spain"), ("IT", "🇮🇹 Italy"),
+    ("PT", "🇵🇹 Portugal"), ("NL", "🇳🇱 Netherlands"), ("BE", "🇧🇪 Belgium"),
+    ("SE", "🇸🇪 Sweden"), ("NO", "🇳🇴 Norway"), ("DK", "🇩🇰 Denmark"),
+    ("FI", "🇫🇮 Finland"), ("AT", "🇦🇹 Austria"), ("CH", "🇨🇭 Switzerland"),
+    ("IE", "🇮🇪 Ireland"), ("CZ", "🇨🇿 Czechia"), ("RO", "🇷🇴 Romania"),
+    ("GR", "🇬🇷 Greece"), ("HU", "🇭🇺 Hungary"), ("TR", "🇹🇷 Turkey"),
+    ("MX", "🇲🇽 Mexico"), ("CA", "🇨🇦 Canada"), ("AR", "🇦🇷 Argentina"),
+    ("CL", "🇨🇱 Chile"), ("CO", "🇨🇴 Colombia"), ("PE", "🇵🇪 Peru"),
+    ("JP", "🇯🇵 Japan"), ("KR", "🇰🇷 South Korea"), ("CN", "🇨🇳 China"),
+    ("IN", "🇮🇳 India"), ("TH", "🇹🇭 Thailand"), ("VN", "🇻🇳 Vietnam"),
+    ("PH", "🇵🇭 Philippines"), ("MY", "🇲🇾 Malaysia"), ("SG", "🇸🇬 Singapore"),
+    ("PK", "🇵🇰 Pakistan"), ("BD", "🇧🇩 Bangladesh"),
+    ("SA", "🇸🇦 Saudi Arabia"), ("AE", "🇦🇪 UAE"), ("IL", "🇮🇱 Israel"),
+    ("EG", "🇪🇬 Egypt"), ("ZA", "🇿🇦 South Africa"), ("NG", "🇳🇬 Nigeria"),
+    ("KE", "🇰🇪 Kenya"), ("MA", "🇲🇦 Morocco"),
+    ("AU", "🇦🇺 Australia"), ("NZ", "🇳🇿 New Zealand"),
+    ("RU", "🇷🇺 Russia"), ("KZ", "🇰🇿 Kazakhstan"),
+]
+COUNTRY_PAGE_SIZE = 8
+
 
 # ---------------- Хелпери налаштувань ----------------
 def resolve_hashtags(prefs: dict) -> list[str]:
@@ -193,7 +219,33 @@ def region_menu_keyboard(lang: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(region_display(lang, k), callback_data=f"select_region_{k}")
             for k in keys[i:i + 2]
         ])
-    rows.append([InlineKeyboardButton(t(lang, "region_custom_button"), callback_data="region_custom")])
+    rows.append([InlineKeyboardButton(t(lang, "region_custom_button"), callback_data="region_more_0")])
+    return InlineKeyboardMarkup(rows)
+
+
+def country_picker_keyboard(lang: str, offset: int) -> InlineKeyboardMarkup:
+    """Гортання довшого списку країн кнопками, по COUNTRY_PAGE_SIZE за раз —
+    ніякого ручного вводу коду, тільки тикати "далі" (per user's request)."""
+    page = MORE_COUNTRIES[offset:offset + COUNTRY_PAGE_SIZE]
+    rows = []
+    for i in range(0, len(page), 2):
+        rows.append([
+            InlineKeyboardButton(label, callback_data=f"select_region_{code}")
+            for code, label in page[i:i + 2]
+        ])
+    nav = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"region_more_{max(0, offset - COUNTRY_PAGE_SIZE)}"))
+    is_last_page = offset + COUNTRY_PAGE_SIZE >= len(MORE_COUNTRIES)
+    if not is_last_page:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"region_more_{offset + COUNTRY_PAGE_SIZE}"))
+    if nav:
+        rows.append(nav)
+    if is_last_page:
+        # Ручний ввід коду — низькопріоритетний останній вихід для рідкісних
+        # країн поза списком, не основний шлях.
+        rows.append([InlineKeyboardButton(t(lang, "region_manual_button"), callback_data="region_custom")])
+    rows.append([InlineKeyboardButton("🔙", callback_data="region_menu")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1105,6 +1157,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             query, context, t(lang, "region_menu_prompt"), reply_markup=region_menu_keyboard(lang),
         )
 
+    elif data.startswith("region_more_"):
+        # Гортання довшого списку країн кнопками — саме перегляд не гейтиться
+        # тарифом (як і preset-кнопки), лише вибір НЕ-Global регіону всередині
+        # select_region_ вже тарифно гейтиться, як і раніше.
+        offset = int(data.removeprefix("region_more_"))
+        await safe_edit_or_send(
+            query, context, t(lang, "region_menu_prompt"),
+            reply_markup=country_picker_keyboard(lang, offset),
+        )
+
     elif data == "region_custom":
         if prefs["tier"] != "pro":
             await safe_edit_or_send(query, context, t(lang, "locked_pro"), reply_markup=region_menu_keyboard(lang))
@@ -1113,8 +1175,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_or_send(query, context, t(lang, "region_custom_prompt"))
 
     elif data.startswith("select_region_"):
+        # Регіон або preset-ключ (з REGIONS), або код країни зі списку
+        # MORE_COUNTRIES / ручного вводу (вже валідований COUNTRY_CODE_RE
+        # там, де вводиться текстом) — обидва шляхи ведуть в один callback.
         region = data.removeprefix("select_region_")
-        if region in REGIONS:
+        if region in REGIONS or COUNTRY_CODE_RE.match(region):
             if region != "global" and prefs["tier"] != "pro":
                 await safe_edit_or_send(
                     query, context, t(lang, "locked_pro"), reply_markup=region_menu_keyboard(lang)
