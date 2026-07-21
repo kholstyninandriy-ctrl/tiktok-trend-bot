@@ -3,7 +3,8 @@ TikTok Trend Bot — персональний трендовий дайджес�
 Apify (скрейпінг TikTok) -> Claude (фільтр + розбір) -> Telegram.
 
 Команди (юзер):
-  /start     — вибір мови (перший раз) + привітання + головне меню
+  /start     — вибір мови (перший раз) -> онбординг-екран (новий юзер) або
+               одразу головне меню (юзер, який вже обрав нішу раніше)
   /niche     — вибрати нішу + конкретні/власні хештеги + регіон (у т.ч. довільний код країни)
   /digest    — дайджест прямо зараз
   /settings  — налаштування
@@ -250,6 +251,25 @@ def language_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def trending_subtags_keyboard(subtags: list[dict]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"#{s['tag']}", callback_data=f"add_subtag_{s['tag']}")] for s in subtags]
+    )
+
+
+def onboarding_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(lang, "btn_onboarding_start"), callback_data="onboarding_start")],
+        [InlineKeyboardButton(t(lang, "btn_onboarding_features"), callback_data="onboarding_features")],
+    ])
+
+
+def onboarding_features_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(t(lang, "btn_onboarding_start"), callback_data="onboarding_start")],
+    ])
+
+
 # ---------------- Apify ----------------
 async def fetch_tiktoks(hashtags: list[str], region: str = "global") -> list[dict]:
     """Тягне свіжі відео по хештегах через Apify (гео — через проксі обраної країни)."""
@@ -304,8 +324,27 @@ def velocity_score(item: dict) -> float:
     return plays / hours
 
 
+def item_hashtag_names(item: dict) -> list[str]:
+    """Хештеги окремого відео з Apify tiktok-scraper. Актор нормалізує їх у
+    "hashtags": [{"id","name","title","cover"}, ...] (name/title зазвичай
+    збігаються). Підстраховуємось на випадок масиву рядків або старішого
+    формату "textExtra": [{"hashtagName": "..."}]."""
+    names = []
+    for h in (item.get("hashtags") or []):
+        name = (h.get("name") or h.get("title")) if isinstance(h, dict) else h
+        if name:
+            names.append(str(name).lstrip("#").lower())
+    if not names:
+        for h in (item.get("textExtra") or []):
+            name = h.get("hashtagName") if isinstance(h, dict) else None
+            if name:
+                names.append(str(name).lstrip("#").lower())
+    return names
+
+
 def prefilter(items: list[dict], top_n: int = 15) -> list[dict]:
-    """Топ-N по velocity, компактні поля для Claude + музичні метадані для 🎵."""
+    """Топ-N по velocity, компактні поля для Claude + музичні метадані для 🎵
+    + хештеги відео для extract_trending_subtags()."""
     ranked = sorted(items, key=velocity_score, reverse=True)[:top_n]
     slim = []
     for it in ranked:
@@ -325,8 +364,35 @@ def prefilter(items: list[dict], top_n: int = 15) -> list[dict]:
             "musicName": music.get("musicName", ""),
             "musicAuthor": music.get("musicAuthor", ""),
             "musicPlayUrl": music.get("playUrl", ""),
+            "hashtags": item_hashtag_names(it),
         })
     return slim
+
+
+def extract_trending_subtags(pool_items: list[dict], base_hashtags: list[str], top_n: int = 5) -> list[dict]:
+    """Хештеги, що спливають у пулі поза базовим пошуком: для кожного —
+    частота серед відео пулу і середня velocity відео, де він зустрічається.
+    Топ-N за комбінацією (частота * середня velocity)."""
+    base = {h.lstrip("#").lower() for h in base_hashtags}
+    stats: dict[str, dict] = {}
+    for v in pool_items:
+        velocity = v.get("velocity_per_hour", 0)
+        seen_in_item = set()
+        for tag in v.get("hashtags") or []:
+            if not tag or tag in base or tag in seen_in_item:
+                continue
+            seen_in_item.add(tag)
+            entry = stats.setdefault(tag, {"tag": tag, "count": 0, "velocity_sum": 0})
+            entry["count"] += 1
+            entry["velocity_sum"] += velocity
+
+    result = []
+    for tag, entry in stats.items():
+        avg_velocity = entry["velocity_sum"] / entry["count"] if entry["count"] else 0
+        result.append({"tag": tag, "count": entry["count"], "avg_velocity": round(avg_velocity)})
+
+    result.sort(key=lambda e: -(e["count"] * e["avg_velocity"]))
+    return result[:top_n]
 
 
 # ---------------- Пул трендів (СПІЛЬНИЙ кеш на niche_key+region — economить Apify-кредити) ----------------
@@ -500,6 +566,7 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, pr
             )
             return
 
+    pool_for_subtags = None
     try:
         videos, fell_back = await ensure_pool(niche_key, hashtags, region)
         if fell_back:
@@ -532,6 +599,7 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, pr
         await db.add_seen(chat_id, niche_key, [v.get("url", "") for v in top])
         await db.increment_digest_count(chat_id)
         text = build_digest_text(lang, top, region) + note
+        pool_for_subtags = videos
     except Exception as e:
         log.exception("Digest failed")
         text = t(lang, "digest_failed", error=escape(str(e)))
@@ -541,6 +609,9 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, pr
         parse_mode=ParseMode.HTML, disable_web_page_preview=True,
         reply_markup=whats_next_keyboard(lang, niche_key),
     )
+
+    if pool_for_subtags:
+        await send_trending_subtags(context, chat_id, lang, pool_for_subtags, hashtags)
 
 
 # ---------------- Музичний дайджест ----------------
@@ -560,6 +631,21 @@ def top_sounds(videos: list[dict], top_n: int = 5) -> list[dict]:
         })
         entry["count"] += 1
     return sorted(counter.values(), key=lambda e: -e["count"])[:top_n]
+
+
+async def send_trending_subtags(context: ContextTypes.DEFAULT_TYPE, chat_id: int, lang: str,
+                                videos: list[dict], base_hashtags: list[str]):
+    """Показує топ-5 хештегів, що спливають у пулі поза базовим пошуком, з
+    кнопками додавання. Викликається і з дайджесту, і з музичного дайджесту —
+    аналіз хештегів той самий, повторний Apify-запит не потрібен."""
+    subtags = extract_trending_subtags(videos, base_hashtags)
+    if not subtags:
+        return
+    tags_str = ", ".join(t(lang, "trending_subtag_item", tag=s["tag"], count=s["count"]) for s in subtags)
+    await context.bot.send_message(
+        chat_id=chat_id, text=t(lang, "trending_subtags_header", tags=tags_str),
+        reply_markup=trending_subtags_keyboard(subtags),
+    )
 
 
 async def send_music_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
@@ -611,6 +697,7 @@ async def send_music_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             parse_mode=ParseMode.HTML, disable_web_page_preview=True,
             reply_markup=whats_next_keyboard(lang, niche_key),
         )
+        await send_trending_subtags(context, chat_id, lang, videos, resolve_hashtags(prefs))
     except Exception as e:
         log.exception("Music digest failed")
         await context.bot.send_message(
@@ -697,16 +784,18 @@ def users_page_keyboard(offset: int, total: int) -> InlineKeyboardMarkup | None:
 
 
 # ---------------- Handlers (юзер) ----------------
-async def send_start_message(message, context: ContextTypes.DEFAULT_TYPE, chat_id: int, lang: str):
-    caption = t(lang, "start_caption", chat_id=chat_id)
+async def send_onboarding_message(message, context: ContextTypes.DEFAULT_TYPE, lang: str):
+    """Перший екран для нового юзера: банер + опис бота, БЕЗ chat_id і БЕЗ
+    інтерактивного головного меню — тільки "🚀 Почати" / "📋 Що вміє бот"."""
+    caption = t(lang, "onboarding_caption")
     try:
         with open(BANNER_PATH, "rb") as banner:
             await message.reply_photo(
                 photo=banner, caption=caption,
-                parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard(lang),
+                parse_mode=ParseMode.HTML, reply_markup=onboarding_keyboard(lang),
             )
     except FileNotFoundError:
-        await message.reply_text(caption, parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard(lang))
+        await message.reply_text(caption, parse_mode=ParseMode.HTML, reply_markup=onboarding_keyboard(lang))
     await message.reply_text(t(lang, "start_menu_hint"), reply_markup=menu_reply_keyboard(lang))
 
 
@@ -716,7 +805,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not prefs.get("lang"):
         await update.message.reply_text(LANGUAGE_PROMPT, reply_markup=language_keyboard())
         return
-    await send_start_message(update.message, context, chat_id, prefs["lang"])
+    lang = prefs["lang"]
+    if prefs.get("niche_key"):
+        # Юзер повертається (вже проходив онбординг і має нішу) — одразу меню дій.
+        await update.message.reply_text(t(lang, "menu_opened"), reply_markup=main_menu_keyboard(lang))
+        return
+    await send_onboarding_message(update.message, context, lang)
 
 
 async def cmd_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1032,6 +1126,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_edit_or_send(query, context, t(lang, "digest_loading_fresh"))
             await send_music_digest(context, chat_id, prefs, style_key)
 
+    elif data.startswith("add_subtag_"):
+        # той самий тариф-гейт, що і "✏️ Свій хештег" — додавання тегу поза
+        # preset-набором доступне лише Pro.
+        tag = data.removeprefix("add_subtag_")
+        if prefs["tier"] != "pro":
+            await safe_edit_or_send(query, context, t(lang, "locked_pro"))
+        else:
+            current = resolve_hashtags(prefs)
+            if tag not in current:
+                await db.update_user(chat_id, hashtags=current + [tag])
+            prefs = await db.get_user(chat_id)
+            niche_key = pool_niche_key(prefs)
+            region = prefs.get("region") or "global"
+            await safe_edit_or_send(query, context, t(lang, "digest_pool_refreshing"))
+            await ensure_pool(niche_key, resolve_hashtags(prefs), region, force=True)
+            await context.bot.send_message(
+                chat_id=chat_id, text=t(lang, "subtag_added", tag=tag),
+                reply_markup=digest_only_keyboard(lang),
+            )
+
     elif data.startswith("lang_"):
         code = data.removeprefix("lang_")
         if code in dict(LANGUAGES):
@@ -1039,11 +1153,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await db.update_user(chat_id, lang=code)
             if first_time:
                 await safe_edit_or_send(query, context, t(code, "language_changed"))
-                await send_start_message(query.message, context, chat_id, code)
+                await send_onboarding_message(query.message, context, code)
             else:
                 await safe_edit_or_send(
                     query, context, t(code, "language_changed"), reply_markup=main_menu_keyboard(code)
                 )
+
+    elif data == "onboarding_start":
+        await safe_edit_or_send(
+            query, context, t(lang, "niche_menu_prompt"), reply_markup=niche_menu_keyboard(lang),
+        )
+
+    elif data == "onboarding_features":
+        await safe_edit_or_send(
+            query, context, t(lang, "onboarding_features_text"), parse_mode=ParseMode.HTML,
+            reply_markup=onboarding_features_keyboard(lang),
+        )
 
     elif data.startswith("admin_users_"):
         if is_admin(chat_id):
