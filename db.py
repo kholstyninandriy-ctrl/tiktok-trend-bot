@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS users (
     ask_mode  INTEGER NOT NULL DEFAULT 0,
     tier      TEXT NOT NULL DEFAULT 'free',
     lang      TEXT,
-    pro_until TEXT
+    pro_until TEXT,
+    onboarded INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS seen_videos (
@@ -103,6 +104,14 @@ async def _migrate(conn: aiosqlite.Connection):
             await conn.execute("ALTER TABLE users ADD COLUMN lang TEXT")
         if "pro_until" not in user_cols:
             await conn.execute("ALTER TABLE users ADD COLUMN pro_until TEXT")
+        if "onboarded" not in user_cols:
+            await conn.execute("ALTER TABLE users ADD COLUMN onboarded INTEGER NOT NULL DEFAULT 0")
+            # Юзери, які вже обрали нішу під старою логікою (де "новий/старий"
+            # визначався по niche_key), фактично вже пройшли онбординг —
+            # інакше вони раптом знову побачать екран "Про бота".
+            await conn.execute(
+                "UPDATE users SET onboarded = 1 WHERE niche_key IS NOT NULL"
+            )
 
     cur = await conn.execute("PRAGMA table_info(trend_pool)")
     pool_cols = {row[1] for row in await cur.fetchall()}
@@ -130,7 +139,7 @@ async def get_user(chat_id: int) -> dict:
     if row is None:
         return {"chat_id": chat_id, "niche_key": None, "hashtags": None,
                 "region": "global", "ask_mode": False, "tier": "free",
-                "lang": None, "pro_until": None}
+                "lang": None, "pro_until": None, "onboarded": False}
     return {
         "chat_id": row["chat_id"],
         "niche_key": row["niche_key"],
@@ -140,20 +149,31 @@ async def get_user(chat_id: int) -> dict:
         "tier": row["tier"] or "free",
         "lang": row["lang"],
         "pro_until": row["pro_until"],
+        "onboarded": bool(row["onboarded"]),
     }
+
+
+async def user_row_exists(chat_id: int) -> bool:
+    """На відміну від get_user() (яка завжди повертає dict із дефолтами),
+    каже, чи є реальний рядок у users — для точної перевірки "це справді
+    перший візит, до будь-якої взаємодії"."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT 1 FROM users WHERE chat_id = ?", (chat_id,))
+        row = await cur.fetchone()
+    return row is not None
 
 
 async def update_user(chat_id: int, **fields):
     """Оновлює окремі поля users (niche_key, hashtags, region, ask_mode,
-    tier, lang, pro_until)."""
-    allowed = {"niche_key", "hashtags", "region", "ask_mode", "tier", "lang", "pro_until"}
+    tier, lang, pro_until, onboarded)."""
+    allowed = {"niche_key", "hashtags", "region", "ask_mode", "tier", "lang", "pro_until", "onboarded"}
     updates = {}
     for key, value in fields.items():
         if key not in allowed:
             raise ValueError(f"unknown user field: {key}")
         if key == "hashtags" and value is not None:
             value = json.dumps(value, ensure_ascii=False)
-        if key == "ask_mode":
+        if key in ("ask_mode", "onboarded"):
             value = int(bool(value))
         updates[key] = value
     async with aiosqlite.connect(DB_PATH) as db:
