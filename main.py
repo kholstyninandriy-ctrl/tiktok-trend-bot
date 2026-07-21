@@ -77,7 +77,7 @@ CHAT_ID = os.environ.get("CHAT_ID")
 HASHTAGS = [h.strip() for h in os.environ.get("HASHTAGS", "football,beauty").split(",")]
 RESULTS_PER_TAG = int(os.environ.get("RESULTS_PER_TAG", "20"))
 DIGEST_HOUR = int(os.environ.get("DIGEST_HOUR", "8"))
-POOL_SIZE = int(os.environ.get("POOL_SIZE", "30"))            # скільки відео тримаємо в кеш-пулі
+POOL_SIZE = int(os.environ.get("POOL_SIZE", "100"))           # скільки відео тримаємо в кеш-пулі
 POOL_TTL_HOURS = int(os.environ.get("POOL_TTL_HOURS", "3"))   # коли пул вважати застарілим
 BATCH_SIZE = 5                                                # скільки відео в одному дайджесті
 
@@ -272,7 +272,11 @@ def onboarding_features_keyboard(lang: str) -> InlineKeyboardMarkup:
 
 # ---------------- Apify ----------------
 async def fetch_tiktoks(hashtags: list[str], region: str = "global") -> list[dict]:
-    """Тягне свіжі відео по хештегах через Apify (гео — через проксі обраної країни)."""
+    """Тягне свіжі відео через Apify (гео — через проксі обраної країни).
+    "hashtags" — це весь поточний набір юзера (base niche + свої/subtags) в
+    ОДНОМУ запиті: актор clockworks/tiktok-scraper приймає масив хештегів і
+    сам агрегує відео по кожному з них в один датасет — окремий запит на
+    кожен хештег не потрібен (і коштував би N Apify-запусків замість одного)."""
     url = (
         f"https://api.apify.com/v2/acts/{APIFY_ACTOR}"
         f"/run-sync-get-dataset-items?token={APIFY_TOKEN}"
@@ -344,8 +348,15 @@ def item_hashtag_names(item: dict) -> list[str]:
 
 def prefilter(items: list[dict], top_n: int = 15) -> list[dict]:
     """Топ-N по velocity, компактні поля для Claude + музичні метадані для 🎵
-    + хештеги відео для extract_trending_subtags()."""
-    ranked = sorted(items, key=velocity_score, reverse=True)[:top_n]
+    + хештеги відео для extract_trending_subtags(). Дедуплікація по
+    webVideoUrl (унікальний id відео) — те саме відео могло збігтись по
+    кількох хештегах одразу в межах одного multi-hashtag Apify-запиту."""
+    deduped: dict[str, dict] = {}
+    for it in items:
+        key = it.get("webVideoUrl") or it.get("shareUrl", "")
+        if key and key not in deduped:
+            deduped[key] = it
+    ranked = sorted(deduped.values(), key=velocity_score, reverse=True)[:top_n]
     slim = []
     for it in ranked:
         music = it.get("musicMeta") or {}
@@ -961,24 +972,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(t(lang, "ask_failed", error=escape(str(e))))
 
 
+def _is_not_modified(exc: BadRequest) -> bool:
+    """Telegram відповідає цим, коли новий текст/markup буквально ідентичні
+    поточним — це НЕ помилка, редагувати нема чого, і точно НЕ привід
+    відсилати дублікат нового повідомлення."""
+    return "message is not modified" in str(exc).lower()
+
+
 async def safe_edit_or_send(query, context: ContextTypes.DEFAULT_TYPE, text: str,
                             reply_markup=None, parse_mode=None):
     """Показує нове inline-меню на місці попереднього, щоб у чаті лишалось
-    тільки ОДНЕ активне меню за раз:
+    тільки ОДНЕ активне меню за раз — один екран = одне повідомлення, яке
+    редагується, а не плодиться:
     1) edit_message_text — для звичайних текстових повідомлень;
     2) edit_message_caption — якщо попереднє повідомлення було фото (/start-банер);
-    3) якщо й це неможливо — знімаємо клавіатуру зі старого повідомлення
-       (edit_message_reply_markup(None)) і шлемо нове."""
+    3) якщо й це неможливо (наприклад, повідомлення нередагованого типу) —
+       знімаємо клавіатуру зі старого повідомлення (edit_message_reply_markup(None))
+       і шлемо нове.
+    На кожному кроці "Message is not modified" — це успіх (контент і так уже
+    такий), а не привід іти далі по ланцюжку фолбеків і зрештою дублювати
+    повідомлення."""
     try:
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
         return
-    except BadRequest:
-        pass
+    except BadRequest as e:
+        if _is_not_modified(e):
+            return
     try:
         await query.edit_message_caption(caption=text, reply_markup=reply_markup, parse_mode=parse_mode)
         return
-    except BadRequest:
-        pass
+    except BadRequest as e:
+        if _is_not_modified(e):
+            return
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except BadRequest:
@@ -1018,7 +1043,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     elif data.startswith("ht_t_"):
-        # toggle чекбокса хештега: ht_t_<niche>_<idx>
+        # toggle чекбокса хештега: ht_t_<niche>_<idx>. Канонічний патерн для
+        # будь-якого майбутнього мультивибору: тільки edit_message_reply_markup
+        # на ТОМУ САМОМУ повідомленні (міняється лише розмітка кнопок, текст
+        # екрана не чіпаємо) — ніколи send_message. "Готово" — окремий крок,
+        # який іде через safe_edit_or_send() і замінює весь екран.
         payload = data.removeprefix("ht_t_")
         niche_key, _, idx_str = payload.rpartition("_")
         if niche_key in NICHES and idx_str.isdigit():
@@ -1031,7 +1060,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=hashtag_keyboard(lang, niche_key, selected, len(custom))
                 )
             except BadRequest:
-                pass  # подвійний клік — розмітка не змінилась
+                pass  # "message is not modified" (подвійний клік) або інший
+                      # неважливий edge case — у жодному разі НЕ шлемо нове повідомлення
 
     elif data.startswith("ht_custom_"):
         niche_key = data.removeprefix("ht_custom_")
