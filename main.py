@@ -1195,6 +1195,10 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.job_queue.run_daily(daily_job, time=dtime(hour=DIGEST_HOUR, tzinfo=timezone.utc))
     app.job_queue.run_daily(pro_expiry_job, time=dtime(hour=0, minute=5, tzinfo=timezone.utc))
+    if not ADMIN_CHAT_ID:
+        log.warning("ADMIN_CHAT_ID не встановлено — адмінські команди недоступні нікому")
+    else:
+        log.info("Admin chat_id: %s", ADMIN_CHAT_ID)
     log.info("Bot started")
     app.run_polling()
 
