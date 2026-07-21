@@ -80,8 +80,8 @@ POOL_SIZE = int(os.environ.get("POOL_SIZE", "30"))            # скільки �
 POOL_TTL_HOURS = int(os.environ.get("POOL_TTL_HOURS", "3"))   # коли пул вважати застарілим
 BATCH_SIZE = 5                                                # скільки відео в одному дайджесті
 
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_CHAT_ID = os.environ.get("734504128")
+ADMIN_USERNAME = os.environ.get("kholstynin", "admin")
 
 FREE_DAILY_DIGEST_LIMIT = 1
 FREE_MUSIC_TOP_N = 3
