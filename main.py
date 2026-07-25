@@ -65,6 +65,7 @@ from locales import (
     region_display,
     t,
 )
+from style import BANNER_DIGEST, BANNER_MUSIC, BANNER_ONBOARDING, BANNER_UPGRADE
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("trendbot")
@@ -84,6 +85,7 @@ BATCH_SIZE = 5                                                # скільки �
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_GROUP_ID = os.environ.get("ADMIN_GROUP_ID")  # напр. -100xxxxxxxxxx; тільки сповіщення, read-only канал
+TENOR_API_KEY = os.environ.get("TENOR_API_KEY")  # гіфки в ключових моментах; не задано -> гіфок просто нема
 
 FREE_DAILY_DIGEST_LIMIT = 1
 FREE_MUSIC_TOP_N = 3
@@ -101,13 +103,17 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # ---- Ніші (назви — через locales.niche_label, тут лише хештеги й емодзі) ----
 NICHES = {
     "football": {"hashtags": ["football", "soccer", "futbol"], "emoji": "⚽"},
-    "beauty": {"hashtags": ["beauty", "makeup", "skincare"], "emoji": "💄"},
+    "beauty": {"hashtags": ["beauty", "makeup", "skincare", "beautysalon", "cosmetology"], "emoji": "💄"},
     "fitness": {"hashtags": ["fitness", "gym", "workout"], "emoji": "💪"},
     "dance": {"hashtags": ["dance", "tiktokdance", "choreography"], "emoji": "💃"},
     "cooking": {"hashtags": ["cooking", "recipe", "food"], "emoji": "🍳"},
     "gaming": {"hashtags": ["gaming", "gamer", "esports"], "emoji": "🎮"},
     "travel": {"hashtags": ["travel", "adventure", "tourism"], "emoji": "✈️"},
     "fashion": {"hashtags": ["fashion", "style", "outfit"], "emoji": "👗"},
+    "horeca": {"hashtags": ["restaurant", "cafe", "foodservice"], "emoji": "🍽️"},
+    "handmade": {"hashtags": ["handmade", "localbusiness", "smallbiz"], "emoji": "🧵"},
+    "education": {"hashtags": ["onlinecourse", "expert", "coaching"], "emoji": "🎓"},
+    "realestate": {"hashtags": ["realestate", "renovation", "interior"], "emoji": "🏠"},
 }
 
 # ---- Регіони: preset -> ISO-код для Apify proxy (None = Global, без проксі).
@@ -205,12 +211,17 @@ def whats_next_keyboard(lang: str, niche_key: str) -> InlineKeyboardMarkup:
 
 
 def niche_menu_keyboard(lang: str) -> InlineKeyboardMarkup:
-    keyboard = []
-    for niche_key, niche_data in NICHES.items():
-        keyboard.append([InlineKeyboardButton(
-            niche_label(lang, niche_key, niche_data["emoji"]), callback_data=f"select_niche_{niche_key}"
-        )])
-    return InlineKeyboardMarkup(keyboard)
+    """Сітка 2 кнопки в рядку — усі ніші видно одразу, без пагінації
+    (на відміну від країн, тут їх достатньо мало для одного екрана)."""
+    keys = list(NICHES)
+    rows = []
+    for i in range(0, len(keys), 2):
+        rows.append([
+            InlineKeyboardButton(
+                niche_label(lang, k, NICHES[k]["emoji"]), callback_data=f"select_niche_{k}"
+            ) for k in keys[i:i + 2]
+        ])
+    return InlineKeyboardMarkup(rows)
 
 
 def region_menu_keyboard(lang: str) -> InlineKeyboardMarkup:
@@ -488,6 +499,7 @@ async def notify_region_fallback(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         chat_id=chat_id,
         text=t(lang, "region_fallback_notice", region=region_display(lang, region)),
     )
+    await send_gif(context, chat_id, "oops sorry funny")
 
 
 async def pool_is_fresh(prefs: dict) -> bool:
@@ -601,6 +613,7 @@ def claude_music_pick(sounds: list[dict], style_label: str, lang: str) -> list[d
 def build_digest_text(lang: str, top: list[dict], region: str) -> str:
     today = datetime.now(timezone.utc).strftime("%d.%m")
     lines = [
+        BANNER_DIGEST,
         t(lang, "digest_header", date=today),
         t(lang, "digest_region_note", region=region_display(lang, region)),
         "",
@@ -659,6 +672,7 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, pr
                 chat_id=chat_id, text=t(lang, "digest_empty"),
                 reply_markup=main_menu_keyboard(lang),
             )
+            await send_gif(context, chat_id, "nothing found funny")
             return
 
         batch = unseen[:15]
@@ -731,9 +745,10 @@ async def send_music_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                 chat_id=chat_id, text=t(lang, "music_empty"),
                 reply_markup=whats_next_keyboard(lang, niche_key),
             )
+            await send_gif(context, chat_id, "nothing found funny")
             return
 
-        lines = [t(lang, "music_header", count=len(videos)), ""]
+        lines = [BANNER_MUSIC, t(lang, "music_header", count=len(videos)), ""]
         for i, s in enumerate(sounds, 1):
             name = escape(s["musicName"] or "—")
             author = f" — {escape(s['musicAuthor'])}" if s["musicAuthor"] else ""
@@ -843,6 +858,43 @@ async def notify_admin_group_new_user(context: ContextTypes.DEFAULT_TYPE, chat_i
         log.warning("Could not notify admin group about new user %s: %s", chat_id, e)
 
 
+async def fetch_gif_url(query: str) -> str | None:
+    """Перший GIF з Tenor за запитом, або None — без ключа, без результатів
+    чи при будь-якій помилці мережі/API. Гіфка — суто декор, тому нічого
+    з цієї функції ніколи не повинно кидати виняток назовні."""
+    if not TENOR_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://tenor.googleapis.com/v2/search",
+                params={
+                    "q": query, "key": TENOR_API_KEY, "limit": 1,
+                    "media_filter": "gif", "contentfilter": "high",
+                },
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results") or []
+            if not results:
+                return None
+            return results[0]["media_formats"]["gif"]["url"]
+    except Exception as e:
+        log.warning("Tenor fetch failed for query '%s': %s", query, e)
+        return None
+
+
+async def send_gif(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, query: str):
+    """Гіфка як ДОДАТКОВЕ повідомлення — ніколи не заміняє основний текст,
+    і будь-яка помилка тут (Tenor, Telegram) не повинна ламати основний флоу."""
+    url = await fetch_gif_url(query)
+    if not url:
+        return
+    try:
+        await context.bot.send_animation(chat_id=chat_id, animation=url)
+    except Exception as e:
+        log.warning("Could not send gif to %s: %s", chat_id, e)
+
+
 async def require_admin(update: Update) -> tuple[bool, str]:
     chat_id = update.effective_chat.id
     prefs = await db.get_user(chat_id)
@@ -882,7 +934,7 @@ def users_page_keyboard(offset: int, total: int) -> InlineKeyboardMarkup | None:
 async def send_onboarding_message(message, context: ContextTypes.DEFAULT_TYPE, lang: str):
     """Перший екран для нового юзера: банер + опис бота, БЕЗ chat_id і БЕЗ
     інтерактивного головного меню — тільки "🚀 Почати" / "📋 Що вміє бот"."""
-    caption = t(lang, "onboarding_caption")
+    caption = BANNER_ONBOARDING + "\n" + t(lang, "onboarding_caption")
     try:
         with open(BANNER_PATH, "rb") as banner:
             await message.reply_photo(
@@ -1002,7 +1054,8 @@ async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
     await update.message.reply_text(
-        t(lang, "upgrade_text", admin_username=ADMIN_USERNAME), parse_mode=ParseMode.HTML
+        BANNER_UPGRADE + "\n" + t(lang, "upgrade_text", admin_username=ADMIN_USERNAME),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -1329,6 +1382,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_or_send(
             query, context, t(lang, "niche_menu_prompt"), reply_markup=niche_menu_keyboard(lang),
         )
+        await send_gif(context, chat_id, "lets go hype")
 
     elif data == "onboarding_features":
         await safe_edit_or_send(
@@ -1401,6 +1455,7 @@ async def cmd_mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=target_chat_id,
             text=t(target_lang, "mark_paid_user_notify", valid_until=valid_until),
         )
+        await send_gif(context, target_chat_id, "celebration party")
     except Exception:
         log.warning("Could not notify %s about mark_paid", target_chat_id)
 

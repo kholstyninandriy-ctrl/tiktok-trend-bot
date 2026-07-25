@@ -42,17 +42,23 @@ LANG_ENGLISH_NAME = {
 
 NICHE_NAMES = {
     "uk": {"football": "Футбол", "beauty": "Краса", "fitness": "Фітнес", "dance": "Танці",
-           "cooking": "Кулінарія", "gaming": "Ігри", "travel": "Подорожі", "fashion": "Мода"},
+           "cooking": "Кулінарія", "gaming": "Ігри", "travel": "Подорожі", "fashion": "Мода",
+           "horeca": "HoReCa", "handmade": "Хендмейд", "education": "Освіта", "realestate": "Нерухомість"},
     "en": {"football": "Football", "beauty": "Beauty", "fitness": "Fitness", "dance": "Dance",
-           "cooking": "Cooking", "gaming": "Gaming", "travel": "Travel", "fashion": "Fashion"},
+           "cooking": "Cooking", "gaming": "Gaming", "travel": "Travel", "fashion": "Fashion",
+           "horeca": "HoReCa", "handmade": "Handmade", "education": "Education", "realestate": "Real Estate"},
     "pt": {"football": "Futebol", "beauty": "Beleza", "fitness": "Fitness", "dance": "Dança",
-           "cooking": "Culinária", "gaming": "Games", "travel": "Viagem", "fashion": "Moda"},
+           "cooking": "Culinária", "gaming": "Games", "travel": "Viagem", "fashion": "Moda",
+           "horeca": "HoReCa", "handmade": "Artesanato", "education": "Educação", "realestate": "Imóveis"},
     "es": {"football": "Fútbol", "beauty": "Belleza", "fitness": "Fitness", "dance": "Baile",
-           "cooking": "Cocina", "gaming": "Videojuegos", "travel": "Viajes", "fashion": "Moda"},
+           "cooking": "Cocina", "gaming": "Videojuegos", "travel": "Viajes", "fashion": "Moda",
+           "horeca": "HoReCa", "handmade": "Hecho a mano", "education": "Educación", "realestate": "Bienes raíces"},
     "fr": {"football": "Football", "beauty": "Beauté", "fitness": "Fitness", "dance": "Danse",
-           "cooking": "Cuisine", "gaming": "Jeux vidéo", "travel": "Voyage", "fashion": "Mode"},
+           "cooking": "Cuisine", "gaming": "Jeux vidéo", "travel": "Voyage", "fashion": "Mode",
+           "horeca": "HoReCa", "handmade": "Fait main", "education": "Éducation", "realestate": "Immobilier"},
     "ru": {"football": "Футбол", "beauty": "Красота", "fitness": "Фитнес", "dance": "Танцы",
-           "cooking": "Кулинария", "gaming": "Игры", "travel": "Путешествия", "fashion": "Мода"},
+           "cooking": "Кулинария", "gaming": "Игры", "travel": "Путешествия", "fashion": "Мода",
+           "horeca": "HoReCa", "handmade": "Хендмейд", "education": "Образование", "realestate": "Недвижимость"},
 }
 
 REGION_NAMES = {
