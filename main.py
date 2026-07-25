@@ -338,12 +338,17 @@ def onboarding_features_keyboard(lang: str) -> InlineKeyboardMarkup:
 
 
 # ---------------- Apify ----------------
-async def fetch_tiktoks(hashtags: list[str], region: str = "global") -> list[dict]:
+async def fetch_tiktoks(hashtags: list[str], region: str = "global",
+                        download_videos: bool = False) -> list[dict]:
     """Тягне свіжі відео через Apify (гео — через проксі обраної країни).
     "hashtags" — це весь поточний набір юзера (base niche + свої/subtags) в
     ОДНОМУ запиті: актор clockworks/tiktok-scraper приймає масив хештегів і
     сам агрегує відео по кожному з них в один датасет — окремий запит на
-    кожен хештег не потрібен (і коштував би N Apify-запусків замість одного)."""
+    кожен хештег не потрібен (і коштував би N Apify-запусків замість одного).
+
+    download_videos=True (лише для Pro, дорожче на Apify) вмикає
+    shouldDownloadVideos — актор докачує сам відеофайл і повертає посилання
+    на нього (item_video_file_url() знає, де саме шукати)."""
     url = (
         f"https://api.apify.com/v2/acts/{APIFY_ACTOR}"
         f"/run-sync-get-dataset-items?token={APIFY_TOKEN}"
@@ -351,7 +356,7 @@ async def fetch_tiktoks(hashtags: list[str], region: str = "global") -> list[dic
     payload = {
         "hashtags": hashtags,
         "resultsPerPage": RESULTS_PER_TAG,
-        "shouldDownloadVideos": False,
+        "shouldDownloadVideos": download_videos,
         "shouldDownloadCovers": True,
     }
     country = region_country_code(region)
@@ -368,17 +373,18 @@ async def fetch_tiktoks(hashtags: list[str], region: str = "global") -> list[dic
     return items
 
 
-async def fetch_tiktoks_safe(hashtags: list[str], region: str) -> tuple[list[dict], bool]:
+async def fetch_tiktoks_safe(hashtags: list[str], region: str,
+                             download_videos: bool = False) -> tuple[list[dict], bool]:
     """Apify з регіоном (preset або довільний ISO-код); якщо country/residential
     proxy недоступний на плані — не падаємо, а повторюємо запит без
     proxyCountryCode (Global). Повертає (items, fell_back_to_global)."""
     try:
-        return await fetch_tiktoks(hashtags, region), False
+        return await fetch_tiktoks(hashtags, region, download_videos=download_videos), False
     except Exception as e:
         if region == "global" or not region_country_code(region):
             raise
         log.warning("Apify з регіоном %s впав (%s) — повторюю як Global", region, e)
-        return await fetch_tiktoks(hashtags, "global"), True
+        return await fetch_tiktoks(hashtags, "global", download_videos=download_videos), True
 
 
 def velocity_score(item: dict) -> float:
@@ -413,6 +419,26 @@ def item_hashtag_names(item: dict) -> list[str]:
     return names
 
 
+def item_video_file_url(item: dict) -> str:
+    """Пряме посилання на СКАЧАНИЙ Apify-копію відеофайлу — з'являється лише
+    коли запит ішов з shouldDownloadVideos=true (Pro). Офіційна документація
+    Apify недоступна для автоматичного фетчу (403, як і для hashtags раніше),
+    і живого Apify-прогону в цьому середовищі нема, тому назву поля
+    підтвердив зовнішнім пошуком по спільній схемі акторів clockworks:
+    "mediaUrls" — масив із посиланням на Apify-CDN копію (саме те, що
+    з'являється при shouldDownloadVideos=true, стабільне для завантаження
+    Telegram-сервером). "videoMeta.downloadAddr"/"originalDownloadAddr" —
+    сирі TikTok CDN URL, присутні незалежно від завантаження, але зазвичай
+    короткоживучі й вимагають TikTok-специфічних заголовків — тому лише як
+    останній фолбек. Варто звірити на реальному прогоні з TENOR-масштабу
+    Pro-запитом, як і застереження щодо hashtags."""
+    media_urls = item.get("mediaUrls")
+    if isinstance(media_urls, list) and media_urls and media_urls[0]:
+        return media_urls[0]
+    video_meta = item.get("videoMeta") or {}
+    return video_meta.get("downloadAddr") or video_meta.get("originalDownloadAddr") or ""
+
+
 def prefilter(items: list[dict], top_n: int = 15) -> list[dict]:
     """Топ-N по velocity, компактні поля для Claude + музичні метадані для 🎵
     + хештеги відео для extract_trending_subtags(). Дедуплікація по
@@ -443,6 +469,7 @@ def prefilter(items: list[dict], top_n: int = 15) -> list[dict]:
             "musicAuthor": music.get("musicAuthor", ""),
             "musicPlayUrl": music.get("playUrl", ""),
             "hashtags": item_hashtag_names(it),
+            "videoFileUrl": item_video_file_url(it),
         })
     return slim
 
@@ -475,10 +502,16 @@ def extract_trending_subtags(pool_items: list[dict], base_hashtags: list[str], t
 
 # ---------------- Пул трендів (СПІЛЬНИЙ кеш на niche_key+region — economить Apify-кредити) ----------------
 async def ensure_pool(niche_key: str, hashtags: list[str], region: str,
-                      force: bool = False) -> tuple[list[dict], bool]:
+                      force: bool = False, download_videos: bool = False) -> tuple[list[dict], bool]:
     """Повертає (пул відео, чи був фолбек на Global). Пул спільний між усіма
     юзерами з однаковою нішею+регіоном — новий Apify run лише коли кеш
-    вичерпано/протух, незалежно від того, хто саме його запросив."""
+    вичерпано/протух, незалежно від того, хто саме його запросив.
+
+    download_videos=True (лише коли явно попросив Pro-виклик) дорожче на
+    Apify, тому НЕ форсить оновлення кешованого пулу самим собою — якщо
+    свіжий пул уже є (нехай і без відеофайлів, з Free-запиту), він
+    повертається як є; send_video у send_digest() просто фолбекне на
+    текстове посилання для тих відео, де файлу нема."""
     if not force:
         cached = await db.get_pool(niche_key, region)
         if cached:
@@ -487,7 +520,7 @@ async def ensure_pool(niche_key: str, hashtags: list[str], region: str,
             if videos and age < timedelta(hours=POOL_TTL_HOURS):
                 log.info("Pool cache hit (shared): niche=%s region=%s", niche_key, region)
                 return videos, False
-    items, fell_back = await fetch_tiktoks_safe(hashtags, region)
+    items, fell_back = await fetch_tiktoks_safe(hashtags, region, download_videos=download_videos)
     videos = prefilter(items, top_n=POOL_SIZE)
     await db.save_pool(niche_key, region, videos)
     await db.log_apify_run(niche_key, region)
@@ -648,7 +681,7 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, pr
 
     pool_for_subtags = None
     try:
-        videos, fell_back = await ensure_pool(niche_key, hashtags, region)
+        videos, fell_back = await ensure_pool(niche_key, hashtags, region, download_videos=(tier == "pro"))
         if fell_back:
             await notify_region_fallback(context, chat_id, lang, region)
         seen = await db.get_seen_urls(chat_id, niche_key)
@@ -656,7 +689,9 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, pr
 
         if len(unseen) < BATCH_SIZE:
             await context.bot.send_message(chat_id=chat_id, text=t(lang, "digest_pool_refreshing"))
-            videos, fell_back2 = await ensure_pool(niche_key, hashtags, region, force=True)
+            videos, fell_back2 = await ensure_pool(
+                niche_key, hashtags, region, force=True, download_videos=(tier == "pro"),
+            )
             if fell_back2 and not fell_back:
                 await notify_region_fallback(context, chat_id, lang, region)
             seen = await db.get_seen_urls(chat_id, niche_key)
@@ -677,22 +712,74 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, pr
 
         batch = unseen[:15]
         top = (await asyncio.to_thread(claude_rank, batch, lang))[:BATCH_SIZE]
+        # claude_rank повертає лише url/cover/why/steal — videoFileUrl (Pro)
+        # довантажуємо назад із batch за url, бо Claude його не бачив і не поверне.
+        by_url = {v.get("url"): v for v in batch if v.get("url")}
+        for item in top:
+            item["videoFileUrl"] = by_url.get(item.get("url"), {}).get("videoFileUrl", "")
         await db.add_seen(chat_id, niche_key, [v.get("url", "") for v in top])
         await db.increment_digest_count(chat_id)
-        text = build_digest_text(lang, top, region) + note
         pool_for_subtags = videos
     except Exception as e:
         log.exception("Digest failed")
-        text = t(lang, "digest_failed", error=escape(str(e)))
+        await context.bot.send_message(
+            chat_id=chat_id, text=t(lang, "digest_failed", error=escape(str(e))),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            reply_markup=whats_next_keyboard(lang, niche_key),
+        )
+        return
 
-    await context.bot.send_message(
-        chat_id=chat_id, text=text,
-        parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-        reply_markup=whats_next_keyboard(lang, niche_key),
-    )
+    if tier == "pro" and any(v.get("videoFileUrl") for v in top):
+        await send_digest_videos_pro(context, chat_id, lang, top, region, note, niche_key)
+    else:
+        text = build_digest_text(lang, top, region) + note
+        await context.bot.send_message(
+            chat_id=chat_id, text=text,
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+            reply_markup=whats_next_keyboard(lang, niche_key),
+        )
 
     if pool_for_subtags:
         await send_trending_subtags(context, chat_id, lang, niche_key, pool_for_subtags, hashtags)
+
+
+async def send_digest_videos_pro(context: ContextTypes.DEFAULT_TYPE, chat_id: int, lang: str,
+                                 top: list[dict], region: str, note: str, niche_key: str):
+    """Pro: кожне відео топ-5 — окреме повідомлення з нативним плеєром
+    Telegram (send_video), а не рядок тексту в одному блоці. Якщо Telegram
+    відхилить конкретний URL (завеликий файл, недоступний тощо) — фолбек на
+    текстовий рядок з посиланням лише для ЦЬОГО відео; решта дайджесту не
+    ламається через одне невдале відео."""
+    today = datetime.now(timezone.utc).strftime("%d.%m")
+    header = "\n".join([
+        BANNER_DIGEST,
+        t(lang, "digest_header", date=today),
+        t(lang, "digest_region_note", region=region_display(lang, region)),
+    ]) + note
+    await context.bot.send_message(chat_id=chat_id, text=header, parse_mode=ParseMode.HTML)
+
+    for i, v in enumerate(top, 1):
+        markup = whats_next_keyboard(lang, niche_key) if i == len(top) else None
+        video_url = v.get("videoFileUrl")
+        sent_video = False
+        if video_url:
+            try:
+                await context.bot.send_video(
+                    chat_id=chat_id, video=video_url,
+                    caption=t(lang, "digest_item_pro_caption", n=i,
+                             why=escape(v.get("why", "")), steal=escape(v.get("steal", ""))),
+                    parse_mode=ParseMode.HTML, reply_markup=markup,
+                )
+                sent_video = True
+            except Exception as e:
+                log.warning("send_video failed for %s, falling back to text: %s", v.get("url"), e)
+        if not sent_video:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=t(lang, "digest_item", n=i, url=escape(v.get("url", "")),
+                      why=escape(v.get("why", "")), steal=escape(v.get("steal", ""))),
+                parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=markup,
+            )
 
 
 # ---------------- Музичний дайджест ----------------
