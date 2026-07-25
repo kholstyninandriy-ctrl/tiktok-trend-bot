@@ -83,6 +83,7 @@ BATCH_SIZE = 5                                                # скільки �
 
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_GROUP_ID = os.environ.get("ADMIN_GROUP_ID")  # напр. -100xxxxxxxxxx; тільки сповіщення, read-only канал
 
 FREE_DAILY_DIGEST_LIMIT = 1
 FREE_MUSIC_TOP_N = 3
@@ -814,6 +815,34 @@ def is_admin(chat_id: int | str) -> bool:
     return bool(ADMIN_CHAT_ID) and str(chat_id) == str(ADMIN_CHAT_ID)
 
 
+def is_admin_group(chat_id: int | str) -> bool:
+    """ADMIN_GROUP_ID — лише вхідний канал сповіщень від бота, read-only:
+    юзерська логіка (меню/флоу/ask/команди) в цьому чаті ігнорується."""
+    return bool(ADMIN_GROUP_ID) and str(chat_id) == str(ADMIN_GROUP_ID)
+
+
+async def notify_admin_group_new_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                                       tg_user, lang: str):
+    """Інформаційне сповіщення про нового юзера — не блокує і не обмежує
+    доступ, лише для видимості. Помилка тут ніколи не повинна ламати
+    онбординг самого юзера."""
+    if not ADMIN_GROUP_ID:
+        return
+    username = f"@{tg_user.username}" if tg_user and tg_user.username else "—"
+    first_name = (tg_user.first_name if tg_user and tg_user.first_name else "—")
+    text = (
+        "🆕 Новий юзер\n"
+        f"chat_id: {chat_id}\n"
+        f"username: {username}\n"
+        f"ім'я: {first_name}\n"
+        f"мова: {lang}"
+    )
+    try:
+        await context.bot.send_message(chat_id=ADMIN_GROUP_ID, text=text)
+    except Exception as e:
+        log.warning("Could not notify admin group about new user %s: %s", chat_id, e)
+
+
 async def require_admin(update: Update) -> tuple[bool, str]:
     chat_id = update.effective_chat.id
     prefs = await db.get_user(chat_id)
@@ -867,6 +896,8 @@ async def send_onboarding_message(message, context: ContextTypes.DEFAULT_TYPE, l
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     prefs = await db.get_user(chat_id)
     if not prefs.get("lang"):
         await update.message.reply_text(LANGUAGE_PROMPT, reply_markup=language_keyboard())
@@ -881,11 +912,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin_group(update.effective_chat.id):
+        return
     await update.message.reply_text(LANGUAGE_PROMPT, reply_markup=language_keyboard())
 
 
 async def cmd_niche(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
     await update.message.reply_text(t(lang, "niche_menu_prompt"), reply_markup=niche_menu_keyboard(lang))
@@ -893,6 +928,8 @@ async def cmd_niche(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
     if await pool_is_fresh(prefs):
@@ -904,6 +941,8 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
     if prefs["tier"] != "pro":
@@ -917,6 +956,8 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
 
@@ -944,6 +985,8 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
     await db.update_user(chat_id, ask_mode=False)
@@ -954,6 +997,8 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
     await update.message.reply_text(
@@ -965,6 +1010,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Звичайні повідомлення: кнопка меню, очікуваний текстовий ввід
     (код регіону / власні хештеги), режим запитань, або fallback-меню."""
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     user_message = (update.message.text or "").strip()
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
@@ -1088,6 +1135,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     chat_id = query.message.chat_id if query.message else query.from_user.id
+    if is_admin_group(chat_id):
+        return
     data = query.data
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
@@ -1263,6 +1312,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             first_time = not prefs["lang"]
             await db.update_user(chat_id, lang=code)
             if first_time:
+                # Єдиний момент, коли рядок юзера справді вперше отримує дані
+                # (lang), тому й сповіщення шлемо рівно тут — рівно один раз.
+                await notify_admin_group_new_user(context, chat_id, update.effective_user, code)
                 await safe_edit_or_send(query, context, t(code, "language_changed"))
                 await send_onboarding_message(query.message, context, code)
             else:
@@ -1300,6 +1352,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- Handlers (адмін) ----------------
 async def cmd_set_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin_group(update.effective_chat.id):
+        return
     ok, lang = await require_admin(update)
     if not ok:
         return
@@ -1317,6 +1371,8 @@ async def cmd_set_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin_group(update.effective_chat.id):
+        return
     ok, lang = await require_admin(update)
     if not ok:
         return
@@ -1350,6 +1406,8 @@ async def cmd_mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin_group(update.effective_chat.id):
+        return
     ok, lang = await require_admin(update)
     if not ok:
         return
@@ -1360,6 +1418,8 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin_group(update.effective_chat.id):
+        return
     ok, lang = await require_admin(update)
     if not ok:
         return
@@ -1379,6 +1439,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_revenue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin_group(update.effective_chat.id):
+        return
     ok, lang = await require_admin(update)
     if not ok:
         return
