@@ -87,6 +87,7 @@ ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 FREE_DAILY_DIGEST_LIMIT = 1
 FREE_MUSIC_TOP_N = 3
 PRO_MUSIC_TOP_N = 5
+FREE_ASK_LIMIT = 2  # довічно, не по днях — feature_usage рахує за весь час
 USERS_PAGE_SIZE = 20
 
 APIFY_ACTOR = "clockworks~tiktok-scraper"
@@ -303,10 +304,12 @@ def language_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def trending_subtags_keyboard(subtags: list[dict]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"#{s['tag']}", callback_data=f"add_subtag_{s['tag']}")] for s in subtags]
-    )
+def trending_subtags_keyboard(lang: str, niche_key: str, subtags: list[dict]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"#{s['tag']}", callback_data=f"add_subtag_{s['tag']}")] for s in subtags]
+    rows.append([InlineKeyboardButton(t(lang, "btn_next"), callback_data=f"next_{niche_key}")])
+    rows.append([InlineKeyboardButton(t(lang, "btn_niche_short"), callback_data="niche_menu")])
+    rows.append([InlineKeyboardButton(t(lang, "btn_main_menu"), callback_data="main_menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 def onboarding_keyboard(lang: str) -> InlineKeyboardMarkup:
@@ -674,7 +677,7 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, pr
     )
 
     if pool_for_subtags:
-        await send_trending_subtags(context, chat_id, lang, pool_for_subtags, hashtags)
+        await send_trending_subtags(context, chat_id, lang, niche_key, pool_for_subtags, hashtags)
 
 
 # ---------------- Музичний дайджест ----------------
@@ -697,7 +700,7 @@ def top_sounds(videos: list[dict], top_n: int = 5) -> list[dict]:
 
 
 async def send_trending_subtags(context: ContextTypes.DEFAULT_TYPE, chat_id: int, lang: str,
-                                videos: list[dict], base_hashtags: list[str]):
+                                niche_key: str, videos: list[dict], base_hashtags: list[str]):
     """Показує топ-5 хештегів, що спливають у пулі поза базовим пошуком, з
     кнопками додавання. Викликається і з дайджесту, і з музичного дайджесту —
     аналіз хештегів той самий, повторний Apify-запит не потрібен."""
@@ -707,7 +710,7 @@ async def send_trending_subtags(context: ContextTypes.DEFAULT_TYPE, chat_id: int
     tags_str = ", ".join(t(lang, "trending_subtag_item", tag=s["tag"], count=s["count"]) for s in subtags)
     await context.bot.send_message(
         chat_id=chat_id, text=t(lang, "trending_subtags_header", tags=tags_str),
-        reply_markup=trending_subtags_keyboard(subtags),
+        reply_markup=trending_subtags_keyboard(lang, niche_key, subtags),
     )
 
 
@@ -760,7 +763,7 @@ async def send_music_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             parse_mode=ParseMode.HTML, disable_web_page_preview=True,
             reply_markup=whats_next_keyboard(lang, niche_key),
         )
-        await send_trending_subtags(context, chat_id, lang, videos, resolve_hashtags(prefs))
+        await send_trending_subtags(context, chat_id, lang, niche_key, videos, resolve_hashtags(prefs))
     except Exception as e:
         log.exception("Music digest failed")
         await context.bot.send_message(
@@ -903,6 +906,11 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
+    if prefs["tier"] != "pro":
+        count = await db.get_feature_count(chat_id, "ask")
+        if count >= FREE_ASK_LIMIT:
+            await update.message.reply_text(t(lang, "feature_limit_reached", feature="ask"))
+            return
     await db.update_user(chat_id, ask_mode=True)
     await update.message.reply_text(t(lang, "ask_mode_start"))
 
@@ -1013,10 +1021,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(t(lang, "fallback_menu"), reply_markup=main_menu_keyboard(lang))
         return
 
+    if prefs["tier"] != "pro":
+        count = await db.get_feature_count(chat_id, "ask")
+        if count >= FREE_ASK_LIMIT:
+            await update.message.reply_text(t(lang, "feature_limit_reached", feature="ask"))
+            return
+
     trends_context = await get_trends_context(prefs)
     await update.message.reply_text(t(lang, "ask_thinking"))
     try:
         response = await asyncio.to_thread(claude_chat, user_message, trends_context, lang)
+        await db.increment_feature_count(chat_id, "ask")
         await update.message.reply_text(
             response, reply_markup=whats_next_keyboard(lang, pool_niche_key(prefs)),
         )
@@ -1268,6 +1283,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             query, context, t(lang, "onboarding_features_text"), parse_mode=ParseMode.HTML,
             reply_markup=onboarding_features_keyboard(lang),
         )
+
+    elif data == "main_menu":
+        # Те саме, що показує /start онбордженому юзеру.
+        await safe_edit_or_send(query, context, t(lang, "menu_opened"), reply_markup=main_menu_keyboard(lang))
 
     elif data.startswith("admin_users_"):
         if is_admin(chat_id):
