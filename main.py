@@ -65,6 +65,7 @@ from locales import (
     region_display,
     t,
 )
+from style import BANNER_DIGEST, BANNER_MUSIC, BANNER_ONBOARDING, BANNER_UPGRADE
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("trendbot")
@@ -83,10 +84,13 @@ BATCH_SIZE = 5                                                # скільки �
 
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_GROUP_ID = os.environ.get("ADMIN_GROUP_ID")  # напр. -100xxxxxxxxxx; тільки сповіщення, read-only канал
+TENOR_API_KEY = os.environ.get("TENOR_API_KEY")  # гіфки в ключових моментах; не задано -> гіфок просто нема
 
 FREE_DAILY_DIGEST_LIMIT = 1
 FREE_MUSIC_TOP_N = 3
 PRO_MUSIC_TOP_N = 5
+FREE_ASK_LIMIT = 2  # довічно, не по днях — feature_usage рахує за весь час
 USERS_PAGE_SIZE = 20
 
 APIFY_ACTOR = "clockworks~tiktok-scraper"
@@ -99,13 +103,17 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # ---- Ніші (назви — через locales.niche_label, тут лише хештеги й емодзі) ----
 NICHES = {
     "football": {"hashtags": ["football", "soccer", "futbol"], "emoji": "⚽"},
-    "beauty": {"hashtags": ["beauty", "makeup", "skincare"], "emoji": "💄"},
+    "beauty": {"hashtags": ["beauty", "makeup", "skincare", "beautysalon", "cosmetology"], "emoji": "💄"},
     "fitness": {"hashtags": ["fitness", "gym", "workout"], "emoji": "💪"},
     "dance": {"hashtags": ["dance", "tiktokdance", "choreography"], "emoji": "💃"},
     "cooking": {"hashtags": ["cooking", "recipe", "food"], "emoji": "🍳"},
     "gaming": {"hashtags": ["gaming", "gamer", "esports"], "emoji": "🎮"},
     "travel": {"hashtags": ["travel", "adventure", "tourism"], "emoji": "✈️"},
     "fashion": {"hashtags": ["fashion", "style", "outfit"], "emoji": "👗"},
+    "horeca": {"hashtags": ["restaurant", "cafe", "foodservice"], "emoji": "🍽️"},
+    "handmade": {"hashtags": ["handmade", "localbusiness", "smallbiz"], "emoji": "🧵"},
+    "education": {"hashtags": ["onlinecourse", "expert", "coaching"], "emoji": "🎓"},
+    "realestate": {"hashtags": ["realestate", "renovation", "interior"], "emoji": "🏠"},
 }
 
 # ---- Регіони: preset -> ISO-код для Apify proxy (None = Global, без проксі).
@@ -203,12 +211,17 @@ def whats_next_keyboard(lang: str, niche_key: str) -> InlineKeyboardMarkup:
 
 
 def niche_menu_keyboard(lang: str) -> InlineKeyboardMarkup:
-    keyboard = []
-    for niche_key, niche_data in NICHES.items():
-        keyboard.append([InlineKeyboardButton(
-            niche_label(lang, niche_key, niche_data["emoji"]), callback_data=f"select_niche_{niche_key}"
-        )])
-    return InlineKeyboardMarkup(keyboard)
+    """Сітка 2 кнопки в рядку — усі ніші видно одразу, без пагінації
+    (на відміну від країн, тут їх достатньо мало для одного екрана)."""
+    keys = list(NICHES)
+    rows = []
+    for i in range(0, len(keys), 2):
+        rows.append([
+            InlineKeyboardButton(
+                niche_label(lang, k, NICHES[k]["emoji"]), callback_data=f"select_niche_{k}"
+            ) for k in keys[i:i + 2]
+        ])
+    return InlineKeyboardMarkup(rows)
 
 
 def region_menu_keyboard(lang: str) -> InlineKeyboardMarkup:
@@ -303,10 +316,12 @@ def language_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def trending_subtags_keyboard(subtags: list[dict]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"#{s['tag']}", callback_data=f"add_subtag_{s['tag']}")] for s in subtags]
-    )
+def trending_subtags_keyboard(lang: str, niche_key: str, subtags: list[dict]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"#{s['tag']}", callback_data=f"add_subtag_{s['tag']}")] for s in subtags]
+    rows.append([InlineKeyboardButton(t(lang, "btn_next"), callback_data=f"next_{niche_key}")])
+    rows.append([InlineKeyboardButton(t(lang, "btn_niche_short"), callback_data="niche_menu")])
+    rows.append([InlineKeyboardButton(t(lang, "btn_main_menu"), callback_data="main_menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 def onboarding_keyboard(lang: str) -> InlineKeyboardMarkup:
@@ -484,6 +499,7 @@ async def notify_region_fallback(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         chat_id=chat_id,
         text=t(lang, "region_fallback_notice", region=region_display(lang, region)),
     )
+    await send_gif(context, chat_id, "oops sorry funny")
 
 
 async def pool_is_fresh(prefs: dict) -> bool:
@@ -597,6 +613,7 @@ def claude_music_pick(sounds: list[dict], style_label: str, lang: str) -> list[d
 def build_digest_text(lang: str, top: list[dict], region: str) -> str:
     today = datetime.now(timezone.utc).strftime("%d.%m")
     lines = [
+        BANNER_DIGEST,
         t(lang, "digest_header", date=today),
         t(lang, "digest_region_note", region=region_display(lang, region)),
         "",
@@ -655,6 +672,7 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, pr
                 chat_id=chat_id, text=t(lang, "digest_empty"),
                 reply_markup=main_menu_keyboard(lang),
             )
+            await send_gif(context, chat_id, "nothing found funny")
             return
 
         batch = unseen[:15]
@@ -674,7 +692,7 @@ async def send_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, pr
     )
 
     if pool_for_subtags:
-        await send_trending_subtags(context, chat_id, lang, pool_for_subtags, hashtags)
+        await send_trending_subtags(context, chat_id, lang, niche_key, pool_for_subtags, hashtags)
 
 
 # ---------------- Музичний дайджест ----------------
@@ -697,7 +715,7 @@ def top_sounds(videos: list[dict], top_n: int = 5) -> list[dict]:
 
 
 async def send_trending_subtags(context: ContextTypes.DEFAULT_TYPE, chat_id: int, lang: str,
-                                videos: list[dict], base_hashtags: list[str]):
+                                niche_key: str, videos: list[dict], base_hashtags: list[str]):
     """Показує топ-5 хештегів, що спливають у пулі поза базовим пошуком, з
     кнопками додавання. Викликається і з дайджесту, і з музичного дайджесту —
     аналіз хештегів той самий, повторний Apify-запит не потрібен."""
@@ -707,7 +725,7 @@ async def send_trending_subtags(context: ContextTypes.DEFAULT_TYPE, chat_id: int
     tags_str = ", ".join(t(lang, "trending_subtag_item", tag=s["tag"], count=s["count"]) for s in subtags)
     await context.bot.send_message(
         chat_id=chat_id, text=t(lang, "trending_subtags_header", tags=tags_str),
-        reply_markup=trending_subtags_keyboard(subtags),
+        reply_markup=trending_subtags_keyboard(lang, niche_key, subtags),
     )
 
 
@@ -727,9 +745,10 @@ async def send_music_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                 chat_id=chat_id, text=t(lang, "music_empty"),
                 reply_markup=whats_next_keyboard(lang, niche_key),
             )
+            await send_gif(context, chat_id, "nothing found funny")
             return
 
-        lines = [t(lang, "music_header", count=len(videos)), ""]
+        lines = [BANNER_MUSIC, t(lang, "music_header", count=len(videos)), ""]
         for i, s in enumerate(sounds, 1):
             name = escape(s["musicName"] or "—")
             author = f" — {escape(s['musicAuthor'])}" if s["musicAuthor"] else ""
@@ -760,7 +779,7 @@ async def send_music_digest(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             parse_mode=ParseMode.HTML, disable_web_page_preview=True,
             reply_markup=whats_next_keyboard(lang, niche_key),
         )
-        await send_trending_subtags(context, chat_id, lang, videos, resolve_hashtags(prefs))
+        await send_trending_subtags(context, chat_id, lang, niche_key, videos, resolve_hashtags(prefs))
     except Exception as e:
         log.exception("Music digest failed")
         await context.bot.send_message(
@@ -811,6 +830,71 @@ def is_admin(chat_id: int | str) -> bool:
     return bool(ADMIN_CHAT_ID) and str(chat_id) == str(ADMIN_CHAT_ID)
 
 
+def is_admin_group(chat_id: int | str) -> bool:
+    """ADMIN_GROUP_ID — лише вхідний канал сповіщень від бота, read-only:
+    юзерська логіка (меню/флоу/ask/команди) в цьому чаті ігнорується."""
+    return bool(ADMIN_GROUP_ID) and str(chat_id) == str(ADMIN_GROUP_ID)
+
+
+async def notify_admin_group_new_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
+                                       tg_user, lang: str):
+    """Інформаційне сповіщення про нового юзера — не блокує і не обмежує
+    доступ, лише для видимості. Помилка тут ніколи не повинна ламати
+    онбординг самого юзера."""
+    if not ADMIN_GROUP_ID:
+        return
+    username = f"@{tg_user.username}" if tg_user and tg_user.username else "—"
+    first_name = (tg_user.first_name if tg_user and tg_user.first_name else "—")
+    text = (
+        "🆕 Новий юзер\n"
+        f"chat_id: {chat_id}\n"
+        f"username: {username}\n"
+        f"ім'я: {first_name}\n"
+        f"мова: {lang}"
+    )
+    try:
+        await context.bot.send_message(chat_id=ADMIN_GROUP_ID, text=text)
+    except Exception as e:
+        log.warning("Could not notify admin group about new user %s: %s", chat_id, e)
+
+
+async def fetch_gif_url(query: str) -> str | None:
+    """Перший GIF з Tenor за запитом, або None — без ключа, без результатів
+    чи при будь-якій помилці мережі/API. Гіфка — суто декор, тому нічого
+    з цієї функції ніколи не повинно кидати виняток назовні."""
+    if not TENOR_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://tenor.googleapis.com/v2/search",
+                params={
+                    "q": query, "key": TENOR_API_KEY, "limit": 1,
+                    "media_filter": "gif", "contentfilter": "high",
+                },
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results") or []
+            if not results:
+                return None
+            return results[0]["media_formats"]["gif"]["url"]
+    except Exception as e:
+        log.warning("Tenor fetch failed for query '%s': %s", query, e)
+        return None
+
+
+async def send_gif(context: ContextTypes.DEFAULT_TYPE, chat_id: int | str, query: str):
+    """Гіфка як ДОДАТКОВЕ повідомлення — ніколи не заміняє основний текст,
+    і будь-яка помилка тут (Tenor, Telegram) не повинна ламати основний флоу."""
+    url = await fetch_gif_url(query)
+    if not url:
+        return
+    try:
+        await context.bot.send_animation(chat_id=chat_id, animation=url)
+    except Exception as e:
+        log.warning("Could not send gif to %s: %s", chat_id, e)
+
+
 async def require_admin(update: Update) -> tuple[bool, str]:
     chat_id = update.effective_chat.id
     prefs = await db.get_user(chat_id)
@@ -850,7 +934,7 @@ def users_page_keyboard(offset: int, total: int) -> InlineKeyboardMarkup | None:
 async def send_onboarding_message(message, context: ContextTypes.DEFAULT_TYPE, lang: str):
     """Перший екран для нового юзера: банер + опис бота, БЕЗ chat_id і БЕЗ
     інтерактивного головного меню — тільки "🚀 Почати" / "📋 Що вміє бот"."""
-    caption = t(lang, "onboarding_caption")
+    caption = BANNER_ONBOARDING + "\n" + t(lang, "onboarding_caption")
     try:
         with open(BANNER_PATH, "rb") as banner:
             await message.reply_photo(
@@ -864,6 +948,8 @@ async def send_onboarding_message(message, context: ContextTypes.DEFAULT_TYPE, l
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     prefs = await db.get_user(chat_id)
     if not prefs.get("lang"):
         await update.message.reply_text(LANGUAGE_PROMPT, reply_markup=language_keyboard())
@@ -878,11 +964,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin_group(update.effective_chat.id):
+        return
     await update.message.reply_text(LANGUAGE_PROMPT, reply_markup=language_keyboard())
 
 
 async def cmd_niche(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
     await update.message.reply_text(t(lang, "niche_menu_prompt"), reply_markup=niche_menu_keyboard(lang))
@@ -890,6 +980,8 @@ async def cmd_niche(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
     if await pool_is_fresh(prefs):
@@ -901,14 +993,23 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
+    if prefs["tier"] != "pro":
+        count = await db.get_feature_count(chat_id, "ask")
+        if count >= FREE_ASK_LIMIT:
+            await update.message.reply_text(t(lang, "feature_limit_reached", feature="ask"))
+            return
     await db.update_user(chat_id, ask_mode=True)
     await update.message.reply_text(t(lang, "ask_mode_start"))
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
 
@@ -936,6 +1037,8 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
     await db.update_user(chat_id, ask_mode=False)
@@ -946,10 +1049,13 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
     await update.message.reply_text(
-        t(lang, "upgrade_text", admin_username=ADMIN_USERNAME), parse_mode=ParseMode.HTML
+        BANNER_UPGRADE + "\n" + t(lang, "upgrade_text", admin_username=ADMIN_USERNAME),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -957,6 +1063,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Звичайні повідомлення: кнопка меню, очікуваний текстовий ввід
     (код регіону / власні хештеги), режим запитань, або fallback-меню."""
     chat_id = update.effective_chat.id
+    if is_admin_group(chat_id):
+        return
     user_message = (update.message.text or "").strip()
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
@@ -1013,10 +1121,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(t(lang, "fallback_menu"), reply_markup=main_menu_keyboard(lang))
         return
 
+    if prefs["tier"] != "pro":
+        count = await db.get_feature_count(chat_id, "ask")
+        if count >= FREE_ASK_LIMIT:
+            await update.message.reply_text(t(lang, "feature_limit_reached", feature="ask"))
+            return
+
     trends_context = await get_trends_context(prefs)
     await update.message.reply_text(t(lang, "ask_thinking"))
     try:
         response = await asyncio.to_thread(claude_chat, user_message, trends_context, lang)
+        await db.increment_feature_count(chat_id, "ask")
         await update.message.reply_text(
             response, reply_markup=whats_next_keyboard(lang, pool_niche_key(prefs)),
         )
@@ -1073,6 +1188,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     chat_id = query.message.chat_id if query.message else query.from_user.id
+    if is_admin_group(chat_id):
+        return
     data = query.data
     prefs = await db.get_user(chat_id)
     lang = user_lang(prefs)
@@ -1248,6 +1365,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             first_time = not prefs["lang"]
             await db.update_user(chat_id, lang=code)
             if first_time:
+                # Єдиний момент, коли рядок юзера справді вперше отримує дані
+                # (lang), тому й сповіщення шлемо рівно тут — рівно один раз.
+                await notify_admin_group_new_user(context, chat_id, update.effective_user, code)
                 await safe_edit_or_send(query, context, t(code, "language_changed"))
                 await send_onboarding_message(query.message, context, code)
             else:
@@ -1262,12 +1382,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_or_send(
             query, context, t(lang, "niche_menu_prompt"), reply_markup=niche_menu_keyboard(lang),
         )
+        await send_gif(context, chat_id, "lets go hype")
 
     elif data == "onboarding_features":
         await safe_edit_or_send(
             query, context, t(lang, "onboarding_features_text"), parse_mode=ParseMode.HTML,
             reply_markup=onboarding_features_keyboard(lang),
         )
+
+    elif data == "main_menu":
+        # Те саме, що показує /start онбордженому юзеру.
+        await safe_edit_or_send(query, context, t(lang, "menu_opened"), reply_markup=main_menu_keyboard(lang))
 
     elif data.startswith("admin_users_"):
         if is_admin(chat_id):
@@ -1281,6 +1406,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- Handlers (адмін) ----------------
 async def cmd_set_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin_group(update.effective_chat.id):
+        return
     ok, lang = await require_admin(update)
     if not ok:
         return
@@ -1298,6 +1425,8 @@ async def cmd_set_tier(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin_group(update.effective_chat.id):
+        return
     ok, lang = await require_admin(update)
     if not ok:
         return
@@ -1326,11 +1455,14 @@ async def cmd_mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=target_chat_id,
             text=t(target_lang, "mark_paid_user_notify", valid_until=valid_until),
         )
+        await send_gif(context, target_chat_id, "celebration party")
     except Exception:
         log.warning("Could not notify %s about mark_paid", target_chat_id)
 
 
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin_group(update.effective_chat.id):
+        return
     ok, lang = await require_admin(update)
     if not ok:
         return
@@ -1341,6 +1473,8 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin_group(update.effective_chat.id):
+        return
     ok, lang = await require_admin(update)
     if not ok:
         return
@@ -1360,6 +1494,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_revenue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin_group(update.effective_chat.id):
+        return
     ok, lang = await require_admin(update)
     if not ok:
         return

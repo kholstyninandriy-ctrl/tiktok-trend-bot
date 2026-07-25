@@ -80,6 +80,13 @@ CREATE TABLE IF NOT EXISTS apify_run_log (
     fetched_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_apify_run_log_fetched ON apify_run_log (fetched_at);
+
+CREATE TABLE IF NOT EXISTS feature_usage (
+    chat_id INTEGER NOT NULL,
+    feature TEXT NOT NULL,
+    count   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (chat_id, feature)
+);
 """
 
 
@@ -282,6 +289,27 @@ async def increment_digest_count(chat_id: int):
             """INSERT INTO daily_usage (chat_id, date, digest_count) VALUES (?, ?, 1)
                ON CONFLICT (chat_id, date) DO UPDATE SET digest_count = digest_count + 1""",
             (chat_id, _today()),
+        )
+        await db.commit()
+
+
+# ---------------- feature_usage (довічний лічильник Claude-фіч, без дати) ----------------
+async def get_feature_count(chat_id: int, feature: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT count FROM feature_usage WHERE chat_id = ? AND feature = ?",
+            (chat_id, feature),
+        )
+        row = await cur.fetchone()
+    return row[0] if row else 0
+
+
+async def increment_feature_count(chat_id: int, feature: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO feature_usage (chat_id, feature, count) VALUES (?, ?, 1)
+               ON CONFLICT (chat_id, feature) DO UPDATE SET count = count + 1""",
+            (chat_id, feature),
         )
         await db.commit()
 
