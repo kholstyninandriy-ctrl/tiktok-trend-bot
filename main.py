@@ -377,14 +377,29 @@ async def fetch_tiktoks_safe(hashtags: list[str], region: str,
                              download_videos: bool = False) -> tuple[list[dict], bool]:
     """Apify з регіоном (preset або довільний ISO-код); якщо country/residential
     proxy недоступний на плані — не падаємо, а повторюємо запит без
-    proxyCountryCode (Global). Повертає (items, fell_back_to_global)."""
+    proxyCountryCode (Global). Повертає (items, fell_back_to_global).
+
+    ТИМЧАСОВЕ діагностичне логування (ЕТАП 1) — перевірити, чи country
+    proxy взагалі реально спрацьовує на нашому Apify-плані, чи регіон
+    завжди тихо фолбечиться на Global. Видалити після діагностики."""
+    country_code = region_country_code(region)
+    log.info("[REGION-DIAG] запит region=%s -> country_code=%s", region, country_code)
     try:
-        return await fetch_tiktoks(hashtags, region, download_videos=download_videos), False
+        result = await fetch_tiktoks(hashtags, region, download_videos=download_videos)
+        log.info("[REGION-DIAG] region=%s (country_code=%s) — OK, без фолбеку, %d відео",
+                 region, country_code, len(result))
+        return result, False
     except Exception as e:
-        if region == "global" or not region_country_code(region):
+        if region == "global" or not country_code:
+            log.info("[REGION-DIAG] region=%s (country_code=%s) — впав, фолбеку нема (сам Global): %s",
+                     region, country_code, e)
             raise
-        log.warning("Apify з регіоном %s впав (%s) — повторюю як Global", region, e)
-        return await fetch_tiktoks(hashtags, "global", download_videos=download_videos), True
+        log.warning(
+            "[REGION-DIAG] region=%s (country_code=%s) — ФОЛБЕК на Global. Точна помилка Apify: %s",
+            region, country_code, e,
+        )
+        result = await fetch_tiktoks(hashtags, "global", download_videos=download_videos)
+        return result, True
 
 
 def velocity_score(item: dict) -> float:
